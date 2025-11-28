@@ -1,0 +1,1117 @@
+---
+- name: Find and upgrade Apache Tomcat 9 to latest version
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    tomcat_latest_version: "9.0.106"  # Will be overridden by detection task
+    tomcat_download_url: "https://archive.apache.org/dist/tomcat/tomcat-9/v{{ tomcat_latest_version }}/bin/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+    tomcat_backup_dir: "/tmp/tomcat_backup_{{ ansible_date_time.epoch }}"
+    tomcat_user: "tomcat"
+    tomcat_group: "tomcat"
+    
+  tasks:
+    - name: Detect latest Tomcat 9 version
+      uri:
+        url: "https://tomcat.apache.org/download-90.cgi"
+        method: GET
+        return_content: yes
+        timeout: 30
+      register: tomcat_download_page
+      delegate_to: localhost
+      run_once: true
+
+    - name: Extract latest Tomcat 9 version number
+      set_fact:
+        tomcat_latest_version: "{{ tomcat_download_page.content | regex_search('apache-tomcat-([0-9]+\\.[0-9]+\\.[0-9]+)\\.tar\\.gz', '\\1') | first }}"
+      delegate_to: localhost
+      run_once: true
+      failed_when: tomcat_latest_version is not defined or tomcat_latest_version == ""
+
+    - name: Validate detected version format
+      assert:
+        that:
+          - tomcat_latest_version is defined
+          - tomcat_latest_version != ""
+          - tomcat_latest_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')
+        fail_msg: "Failed to detect a valid Tomcat version. Got: {{ tomcat_latest_version | default('undefined') }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Display detected Tomcat version
+      debug:
+        msg: "Detected latest Tomcat 9 version: {{ tomcat_latest_version }}"
+      run_once: true
+
+    - name: Update download URL with detected version
+      set_fact:
+        tomcat_download_url: "https://archive.apache.org/dist/tomcat/tomcat-9/v{{ tomcat_latest_version }}/bin/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+      run_once: true
+
+    - name: Verify download URL is accessible
+      uri:
+        url: "{{ tomcat_download_url }}"
+        method: HEAD
+        timeout: 30
+      register: download_url_check
+      delegate_to: localhost
+      run_once: true
+
+    - name: Use mirror download URL if primary fails
+      block:
+        - name: Try mirror download URL
+          set_fact:
+            tomcat_download_url: "https://dlcdn.apache.org/tomcat/tomcat-9/v{{ tomcat_latest_version }}/bin/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+          run_once: true
+
+        - name: Verify mirror download URL
+          uri:
+            url: "{{ tomcat_download_url }}"
+            method: HEAD
+            timeout: 30
+          register: mirror_url_check
+          delegate_to: localhost
+          run_once: true
+
+        - name: Display final download URL
+          debug:
+            msg: "Using download URL: {{ tomcat_download_url }}"
+          run_once: true
+
+      when: download_url_check.failed is defined and download_url_check.failed
+
+    - name: Fallback version detection using directory listing
+      block:
+        - name: Get available versions from Apache directory
+          uri:
+            url: "https://archive.apache.org/dist/tomcat/tomcat-9/"
+            method: GET
+            return_content: yes
+            timeout: 30
+          register: tomcat_versions_page
+          delegate_to: localhost
+          run_once: true
+
+        - name: Extract version numbers from directory listing
+          set_fact:
+            available_versions: "{{ tomcat_versions_page.content | regex_findall('v([0-9]+\\.[0-9]+\\.[0-9]+)') | sort_versions | reverse }}"
+          delegate_to: localhost
+          run_once: true
+
+        - name: Set latest version from directory listing
+          set_fact:
+            tomcat_latest_version: "{{ available_versions[0] }}"
+            tomcat_download_url: "https://archive.apache.org/dist/tomcat/tomcat-9/v{{ available_versions[0] }}/bin/apache-tomcat-{{ available_versions[0] }}.tar.gz"
+          run_once: true
+
+        - name: Display fallback version
+          debug:
+            msg: "Using fallback version detection: {{ tomcat_latest_version }}"
+          run_once: true
+
+      when: 
+        - tomcat_latest_version is not defined or tomcat_latest_version == ""
+        - download_url_check.failed is defined and download_url_check.failed
+        - mirror_url_check.failed is defined and mirror_url_check.failed
+
+    - name: Check if system is supported
+      assert:
+        that:
+          - ansible_os_family in ['RedHat', 'Debian', 'Ubuntu']
+        fail_msg: "This playbook only supports RedHat/CentOS/RHEL and Debian/Ubuntu systems"
+
+    - name: Create backup directory
+      file:
+        path: "{{ tomcat_backup_dir }}"
+        state: directory
+        mode: '0755'
+
+    # Enhanced Tomcat Detection Logic (based on robust report methods)
+    - name: Find Tomcat installations by running processes
+      shell: |
+        ps aux | grep -i catalina | grep -v grep | awk '{print $2}' | while read pid; do
+          if [ -n "$pid" ]; then
+            readlink -f /proc/$pid/exe 2>/dev/null || echo "unknown"
+          fi
+        done | sort -u
+      register: tomcat_processes
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Find Tomcat installations in common directories
+      find:
+        paths:
+          - /opt
+          - /usr/local
+          - /home
+          - /var/lib
+        patterns:
+          - "tomcat*"
+          - "apache-tomcat*"
+        file_type: directory
+        recurse: no
+      register: tomcat_directories
+      ignore_errors: yes
+
+    - name: Find Tomcat binary locations
+      shell: |
+        find /opt /usr/local /home /var/lib -name "catalina.sh" -type f 2>/dev/null | head -20
+      register: tomcat_binaries
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Check systemd services
+      shell: |
+        systemctl list-units --type=service --all | grep -i tomcat | awk '{print $1}'
+      register: tomcat_services
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Combine and deduplicate Tomcat installations
+      set_fact:
+        potential_tomcat_dirs: "{{ (tomcat_directories.files | map(attribute='path') | list) + (tomcat_binaries.stdout_lines | map('dirname') | map('dirname') | list) }}"
+
+    - name: Filter valid Tomcat installations
+      set_fact:
+        valid_tomcat_dirs: "{{ valid_tomcat_dirs | default([]) + [item] }}"
+      loop: "{{ potential_tomcat_dirs | unique }}"
+      when: 
+        - item is defined
+        - item != ""
+
+    - name: Check for Java availability and install if needed
+      block:
+        - name: Check if Java is available
+          shell: |
+            # Check for Java in various locations
+            if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+              echo "found:$JAVA_HOME/bin/java"
+            elif command -v java >/dev/null 2>&1; then
+              echo "found:$(command -v java)"
+            elif [ -x "/usr/bin/java" ]; then
+              echo "found:/usr/bin/java"
+            elif [ -x "/usr/local/bin/java" ]; then
+              echo "found:/usr/local/bin/java"
+            else
+              echo "not_found"
+            fi
+          register: java_check
+          ignore_errors: yes
+          changed_when: false
+
+        - name: Install Java temporarily if not found
+          block:
+            - name: Detect OS and install Java
+              shell: |
+                if [ -f /etc/redhat-release ] || [ -f /etc/centos-release ]; then
+                  # RHEL/CentOS
+                  echo "Installing Java on RHEL/CentOS..."
+                  yum install -y java-1.8.0-openjdk 2>/dev/null || yum install -y java-11-openjdk 2>/dev/null || echo "Java installation failed"
+                elif [ -f /etc/debian_version ]; then
+                  # Debian/Ubuntu
+                  echo "Installing Java on Debian/Ubuntu..."
+                  apt-get update -qq 2>/dev/null
+                  apt-get install -y openjdk-8-jdk 2>/dev/null || apt-get install -y openjdk-11-jdk 2>/dev/null || echo "Java installation failed"
+                elif [ -f /etc/arch-release ]; then
+                  # Arch Linux
+                  echo "Installing Java on Arch Linux..."
+                  pacman -S --noconfirm jdk8-openjdk 2>/dev/null || pacman -S --noconfirm jdk11-openjdk 2>/dev/null || echo "Java installation failed"
+                elif [ -f /etc/alpine-release ]; then
+                  # Alpine Linux
+                  echo "Installing Java on Alpine Linux..."
+                  apk add --no-cache openjdk8 2>/dev/null || apk add --no-cache openjdk11 2>/dev/null || echo "Java installation failed"
+                elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
+                  # SUSE
+                  echo "Installing Java on SUSE..."
+                  zypper install -y java-1_8_0-openjdk 2>/dev/null || zypper install -y java-11-openjdk 2>/dev/null || echo "Java installation failed"
+                else
+                  echo "Unknown OS, cannot install Java automatically"
+                fi
+              register: java_install
+              ignore_errors: yes
+              changed_when: false
+              when: java_check.stdout == "not_found"
+
+            - name: Set Java installation flag
+              set_fact:
+                java_was_installed: true
+              when: 
+                - java_check.stdout == "not_found"
+                - java_install is defined
+                - java_install.stdout is defined
+
+          when: java_check.stdout == "not_found"
+
+    - name: Get Tomcat version information with enhanced detection
+      shell: |
+        TOMCAT_DIR="{{ item }}"
+        echo "DEBUG: Checking Tomcat directory: $TOMCAT_DIR" >&2
+        
+        # Function to get Java command
+        get_java_cmd() {
+          if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+            echo "$JAVA_HOME/bin/java"
+          elif command -v java >/dev/null 2>&1; then
+            echo "java"
+          elif [ -x "/usr/bin/java" ]; then
+            echo "/usr/bin/java"
+          elif [ -x "/usr/local/bin/java" ]; then
+            echo "/usr/local/bin/java"
+          else
+            echo ""
+          fi
+        }
+        
+        # Method 1: Try version.sh
+        if [ -f "$TOMCAT_DIR/bin/version.sh" ] && [ -x "$TOMCAT_DIR/bin/version.sh" ]; then
+          cd "$TOMCAT_DIR/bin" 2>/dev/null
+          VERSION=$(./version.sh 2>/dev/null | grep "Server version" | head -1 | sed 's/Server version: //')
+          if [ -n "$VERSION" ]; then
+            echo "$VERSION"
+            exit 0
+          fi
+        fi
+        
+        # Method 2: Try catalina.sh
+        if [ -f "$TOMCAT_DIR/bin/catalina.sh" ] && [ -x "$TOMCAT_DIR/bin/catalina.sh" ]; then
+          cd "$TOMCAT_DIR/bin" 2>/dev/null
+          VERSION=$(./catalina.sh version 2>/dev/null | grep "Server version" | head -1 | sed 's/Server version: //')
+          if [ -n "$VERSION" ]; then
+            echo "$VERSION"
+            exit 0
+          fi
+        fi
+        
+        # Method 3: Try Java-based version detection
+        if [ -f "$TOMCAT_DIR/lib/catalina.jar" ]; then
+          cd "$TOMCAT_DIR/lib" 2>/dev/null
+          JAVA_CMD=$(get_java_cmd)
+          if [ -n "$JAVA_CMD" ]; then
+            VERSION=$($JAVA_CMD -cp catalina.jar org.apache.catalina.util.ServerInfo 2>/dev/null | grep "Server version" | head -1 | sed 's/Server version: //')
+            if [ -n "$VERSION" ]; then
+              echo "$VERSION"
+              exit 0
+            fi
+          fi
+        fi
+        
+        # Method 4: Try directory name extraction
+        DIR_NAME=$(basename "$TOMCAT_DIR")
+        VERSION=$(echo "$DIR_NAME" | sed -n 's/.*[Tt]omcat[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+        if [ -n "$VERSION" ]; then
+          echo "Apache Tomcat/$VERSION (extracted from directory name)"
+          exit 0
+        fi
+        
+        echo "Version: Unknown"
+      register: tomcat_versions
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Get Tomcat running process information
+      shell: |
+        TOMCAT_DIR="{{ item }}"
+        RUNNING_COUNT=0
+        RUNNING_PIDS=""
+        RUNNING_PORTS=""
+        
+        # Find processes running from this Tomcat installation
+        for pid in $(ps aux | grep java | grep -i catalina | grep "$TOMCAT_DIR" | grep -v grep | awk '{print $2}'); do
+          if [ -n "$pid" ]; then
+            RUNNING_COUNT=$((RUNNING_COUNT + 1))
+            RUNNING_PIDS="$RUNNING_PIDS$pid "
+            
+            # Get ports this process is listening on
+            if command -v netstat >/dev/null 2>&1; then
+              PORTS=$(netstat -tlnp 2>/dev/null | grep "$pid/" | awk '{print $4}' | sed 's/.*://' | sort -n | tr '\n' ',' | sed 's/,$//')
+              if [ -n "$PORTS" ]; then
+                RUNNING_PORTS="$RUNNING_PORTS$PORTS,"
+              fi
+            fi
+            
+            # Also check using lsof if available
+            if command -v lsof >/dev/null 2>&1; then
+              LSOF_PORTS=$(lsof -Pan -p $pid -i 2>/dev/null | grep LISTEN | awk -F: '{print $2}' | awk '{print $1}' | sort -n | tr '\n' ',' | sed 's/,$//')
+              if [ -n "$LSOF_PORTS" ]; then
+                RUNNING_PORTS="$RUNNING_PORTS$LSOF_PORTS,"
+              fi
+            fi
+          fi
+        done
+        
+        # Format output
+        if [ "$RUNNING_COUNT" -gt 0 ]; then
+          RUNNING_PORTS=$(echo "$RUNNING_PORTS" | tr ',' '\n' | sort -nu | tr '\n' ',' | sed 's/,$//')
+          echo "RUNNING:$RUNNING_COUNT:$RUNNING_PIDS:$RUNNING_PORTS"
+        else
+          echo "STOPPED:0::"
+        fi
+      register: tomcat_running_status
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Compile Tomcat installation data with enhanced detection
+      set_fact:
+        tomcat_installations: "{{ tomcat_installations | default([]) + [installation_data] }}"
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      loop_control:
+        index_var: index
+      when: valid_tomcat_dirs is defined and valid_tomcat_dirs | length > 0
+      vars:
+        version_info: "{{ (tomcat_versions.results[index].stdout | default('Unknown')) if tomcat_versions.results is defined and index < (tomcat_versions.results | length) else 'Unknown' }}"
+        running_info: "{{ (tomcat_running_status.results[index].stdout | default('STOPPED:0::')) if tomcat_running_status.results is defined and index < (tomcat_running_status.results | length) else 'STOPPED:0::' }}"
+        running_parts: "{{ running_info.split(':') }}"
+        installation_data:
+          path: "{{ item }}"
+          name: "{{ item | basename }}"
+          version_raw: "{{ version_info }}"
+          version: "{{ version_info | regex_search('Apache Tomcat/([0-9]+\\.[0-9]+\\.[0-9]+)', '\\1') | first | default('unknown') }}"
+          is_running: "{{ running_parts[0] == 'RUNNING' }}"
+          running_count: "{{ running_parts[1] | int }}"
+          running_pids: "{{ running_parts[2].split(' ') | select('match', '^[0-9]+$') | list }}"
+          running_ports: "{{ running_parts[3].split(',') | select('match', '^[0-9]+$') | list }}"
+          needs_upgrade: "{{ false }}"  # Will be set later after version comparison
+
+    - name: Filter for Tomcat 9 installations only
+      set_fact:
+        tomcat9_installations: "{{ tomcat9_installations | default([]) + [item] }}"
+      loop: "{{ tomcat_installations | default([]) }}"
+      when: 
+        - item.version != 'unknown'
+        - item.version is version('9.0.0', '>=')
+        - item.version is version('10.0.0', '<')
+
+    - name: Determine which Tomcat 9 installations need upgrade
+      set_fact:
+        tomcat9_installations: "{{ tomcat9_installations | default([]) | map('combine', {'needs_upgrade': item.version != tomcat_latest_version}) | list }}"
+      loop: "{{ tomcat9_installations | default([]) }}"
+      when: tomcat9_installations is defined
+
+    - name: Display detailed installation information
+      debug:
+        msg: |
+          Tomcat Installation Found:
+          - Path: {{ item.path }}
+          - Name: {{ item.name }}
+          - Version: {{ item.version }} ({{ item.version_raw }})
+          - Running: {{ 'Yes' if item.is_running else 'No' }}
+          {% if item.is_running %}
+          - Running Processes: {{ item.running_count }}
+          - PIDs: {{ item.running_pids | join(', ') }}
+          - Ports: {{ item.running_ports | join(', ') }}
+          {% endif %}
+          - Needs Upgrade: {{ 'Yes' if item.needs_upgrade else 'No' }}
+          - Latest Version: {{ tomcat_latest_version }}
+      loop: "{{ tomcat9_installations | default([]) }}"
+
+    - name: Check for running Tomcat processes that need upgrade
+      set_fact:
+        running_upgrades: "{{ running_upgrades | default([]) + [item] }}"
+      loop: "{{ tomcat9_installations | default([]) }}"
+      when: 
+        - item.needs_upgrade
+        - item.is_running
+
+    - name: Display running processes that will need to be stopped
+      debug:
+        msg: |
+          Running Tomcat Installation that needs upgrade:
+          - Path: {{ item.path }}
+          - Version: {{ item.version }}
+          - Running Processes: {{ item.running_count }}
+          - PIDs: {{ item.running_pids | join(', ') }}
+          - Ports: {{ item.running_ports | join(', ') }}
+          These processes will need to be stopped before upgrade.
+      loop: "{{ running_upgrades | default([]) }}"
+      when: running_upgrades is defined and running_upgrades | length > 0
+
+    - name: Prompt for process termination confirmation
+      pause:
+        prompt: |
+          
+          WARNING: {{ running_upgrades | default([]) | length }} running Tomcat installation(s) need to be upgraded.
+          This will require stopping the following processes:
+          
+          {% for upgrade in running_upgrades | default([]) %}
+          - {{ upgrade.path }} (PIDs: {{ upgrade.running_pids | join(', ') }}, Ports: {{ upgrade.running_ports | join(', ') }})
+          {% endfor %}
+          
+          Do you want to continue with the upgrade? This will:
+          1. Stop all running Tomcat processes
+          2. Create backups of existing installations
+          3. Upgrade to version {{ tomcat_latest_version }}
+          4. Restart the services
+          
+          Press ENTER to continue, or Ctrl+C to abort.
+      when: 
+        - running_upgrades is defined 
+        - running_upgrades | length > 0
+        - not (auto_confirm_upgrade | default(false))
+
+    - name: Filter upgrades that need to be performed
+      set_fact:
+        upgrades_to_perform: "{{ upgrades_to_perform | default([]) + [item] }}"
+      loop: "{{ tomcat9_installations | default([]) }}"
+      when: item.needs_upgrade
+
+    - name: Display upgrade summary
+      debug:
+        msg: |
+          Tomcat 9 Installation Summary:
+          - Total Tomcat installations found: {{ tomcat_installations | default([]) | length }}
+          - Tomcat 9 installations found: {{ tomcat9_installations | default([]) | length }}
+          - Installations needing upgrade: {{ upgrades_to_perform | default([]) | length }}
+          - Running installations to upgrade: {{ running_upgrades | default([]) | length }}
+          - Up-to-date installations: {{ (tomcat9_installations | default([]) | length) - (upgrades_to_perform | default([]) | length) }}
+          - Latest available version: {{ tomcat_latest_version }}
+      when: tomcat_installations is defined or tomcat9_installations is defined
+
+    - name: Check if any upgrades are needed
+      set_fact:
+        skip_upgrade: true
+      when: 
+        - upgrades_to_perform is not defined or upgrades_to_perform | length == 0
+        - tomcat9_installations is defined and tomcat9_installations | length > 0
+
+    - name: Display skip upgrade message
+      debug:
+        msg: |
+          All Tomcat 9 installations are already up-to-date!
+          No upgrades needed. All installations are running version {{ tomcat_latest_version }}.
+      when: skip_upgrade is defined and skip_upgrade
+
+    - name: Verify upgrade prerequisites
+      assert:
+        that:
+          - upgrades_to_perform is defined
+          - upgrades_to_perform | length > 0
+        fail_msg: "No Tomcat 9 installations found that need upgrading. All installations are up-to-date."
+      when: skip_upgrade is not defined
+
+    - name: Display Tomcat 9 installations that will be upgraded
+      debug:
+        msg: |
+          Will upgrade Tomcat 9 installation:
+          - Path: {{ item.path }}
+          - Current Version: {{ item.version }}
+          - Target Version: {{ tomcat_latest_version }}
+          - Currently Running: {{ 'Yes' if item.is_running else 'No' }}
+          {% if item.is_running %}
+          - Running PIDs: {{ item.running_pids | join(', ') }}
+          - Running Ports: {{ item.running_ports | join(', ') }}
+          {% endif %}
+      loop: "{{ upgrades_to_perform | default([]) }}"
+
+    - name: Stop running Tomcat processes for upgrade
+      shell: |
+        TOMCAT_DIR="{{ item.path }}"
+        echo "Stopping Tomcat processes for $TOMCAT_DIR"
+        
+        # Try graceful shutdown first
+        if [ -f "$TOMCAT_DIR/bin/shutdown.sh" ]; then
+          echo "Attempting graceful shutdown..."
+          cd "$TOMCAT_DIR"
+          ./bin/shutdown.sh
+          sleep 10
+        fi
+        
+        # Check if processes are still running
+        REMAINING_PIDS=""
+        {% for pid in item.running_pids %}
+        if kill -0 {{ pid }} 2>/dev/null; then
+          REMAINING_PIDS="$REMAINING_PIDS {{ pid }}"
+        fi
+        {% endfor %}
+        
+        # Force kill remaining processes
+        if [ -n "$REMAINING_PIDS" ]; then
+          echo "Force killing remaining processes: $REMAINING_PIDS"
+          for pid in $REMAINING_PIDS; do
+            kill -9 $pid 2>/dev/null || true
+          done
+          sleep 5
+        fi
+        
+        # Verify all processes are stopped
+        STILL_RUNNING=""
+        {% for pid in item.running_pids %}
+        if kill -0 {{ pid }} 2>/dev/null; then
+          STILL_RUNNING="$STILL_RUNNING {{ pid }}"
+        fi
+        {% endfor %}
+        
+        if [ -n "$STILL_RUNNING" ]; then
+          echo "ERROR: Some processes are still running: $STILL_RUNNING"
+          exit 1
+        else
+          echo "All processes stopped successfully"
+        fi
+      register: process_stop_results
+      loop: "{{ upgrades_to_perform | default([]) }}"
+      when: 
+        - upgrades_to_perform is defined
+        - item.is_running
+        - skip_upgrade is not defined
+      ignore_errors: yes
+
+    - name: Stop Tomcat services before upgrade
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop: "{{ tomcat_services.stdout_lines | default([]) }}"
+      when: 
+        - tomcat_services.stdout_lines is defined
+        - skip_upgrade is not defined
+      ignore_errors: yes
+
+    - name: Create comprehensive backup of existing Tomcat installations
+      block:
+        - name: Create individual backup directories
+          file:
+            path: "{{ tomcat_backup_dir }}/{{ item.name }}"
+            state: directory
+            mode: '0755'
+          loop: "{{ upgrades_to_perform | default([]) }}"
+
+        - name: Create tar backup of each Tomcat installation
+          archive:
+            path: "{{ item.path }}"
+            dest: "{{ tomcat_backup_dir }}/{{ item.name }}/tomcat_backup_{{ item.name }}_{{ ansible_date_time.epoch }}.tar"
+            format: tar
+            owner: root
+            group: root
+            mode: '0644'
+          loop: "{{ upgrades_to_perform | default([]) }}"
+          register: backup_results
+
+        - name: Create backup metadata file
+          copy:
+            content: |
+              # Tomcat Backup Metadata
+              # Created: {{ ansible_date_time.iso8601 }}
+              # Hostname: {{ ansible_hostname }}
+              # Playbook executed by: {{ ansible_user_id }}
+              
+              {% for item in upgrades_to_perform | default([]) %}
+              [{{ item.name }}]
+              original_path={{ item.path }}
+              backup_file={{ tomcat_backup_dir }}/{{ item.name }}/tomcat_backup_{{ item.name }}_{{ ansible_date_time.epoch }}.tar
+              hostname={{ ansible_hostname }}
+              backup_date={{ ansible_date_time.iso8601 }}
+              original_version={{ item.version_raw }}
+              upgraded_to={{ tomcat_latest_version }}
+              was_running={{ item.is_running }}
+              running_pids={{ item.running_pids | join(',') }}
+              running_ports={{ item.running_ports | join(',') }}
+              user={{ tomcat_user }}
+              group={{ tomcat_group }}
+              
+              {% endfor %}
+            dest: "{{ tomcat_backup_dir }}/backup_metadata.txt"
+            mode: '0644'
+
+        - name: Create JSON backup metadata for automation
+          copy:
+            content: |
+              {
+                "backup_info": {
+                  "created": "{{ ansible_date_time.iso8601 }}",
+                  "hostname": "{{ ansible_hostname }}",
+                  "executor": "{{ ansible_user_id }}",
+                  "latest_version": "{{ tomcat_latest_version }}"
+                },
+                "installations": [
+              {% for item in upgrades_to_perform | default([]) %}
+                  {
+                    "name": "{{ item.name }}",
+                    "original_path": "{{ item.path }}",
+                    "backup_file": "{{ tomcat_backup_dir }}/{{ item.name }}/tomcat_backup_{{ item.name }}_{{ ansible_date_time.epoch }}.tar",
+                    "hostname": "{{ ansible_hostname }}",
+                    "backup_date": "{{ ansible_date_time.iso8601 }}",
+                    "original_version": "{{ item.version_raw }}",
+                    "upgraded_to": "{{ tomcat_latest_version }}",
+                    "was_running": {{ item.is_running | lower }},
+                    "running_pids": {{ item.running_pids | to_json }},
+                    "running_ports": {{ item.running_ports | to_json }},
+                    "user": "{{ tomcat_user }}",
+                    "group": "{{ tomcat_group }}"
+                  }{% if not loop.last %},{% endif %}
+              {% endfor %}
+                ]
+              }
+            dest: "{{ tomcat_backup_dir }}/backup_metadata.json"
+            mode: '0644'
+
+        - name: Display backup information
+          debug:
+            msg: |
+              Created backup for {{ item.item.name }}:
+              - Original path: {{ item.item.path }}
+              - Backup file: {{ tomcat_backup_dir }}/{{ item.item.name }}/tomcat_backup_{{ item.item.name }}_{{ ansible_date_time.epoch }}.tar
+              - Original version: {{ item.item.version_raw }}
+              - Was running: {{ item.item.is_running }}
+              {% if item.item.is_running %}
+              - Running PIDs: {{ item.item.running_pids | join(', ') }}
+              - Running ports: {{ item.item.running_ports | join(', ') }}
+              {% endif %}
+          loop: "{{ backup_results.results | default([]) }}"
+          when: backup_results.results is defined
+
+      when: 
+        - upgrades_to_perform is defined
+        - skip_upgrade is not defined
+
+    - name: Download latest Tomcat 9 to Ansible controller
+      get_url:
+        url: "{{ tomcat_download_url }}"
+        dest: "/tmp/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+        mode: '0644'
+        timeout: 300
+      delegate_to: localhost
+      run_once: true
+      when: 
+        - upgrades_to_perform is defined 
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+
+    - name: Copy Tomcat archive from controller to target servers
+      copy:
+        src: "/tmp/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+        dest: "/tmp/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+        mode: '0644'
+      when: 
+        - upgrades_to_perform is defined 
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+
+    - name: Extract new Tomcat version to temporary location
+      unarchive:
+        src: "/tmp/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+        dest: "/tmp"
+        remote_src: yes
+      when: 
+        - upgrades_to_perform is defined 
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+
+    - name: Upgrade each Tomcat installation
+      block:
+        - name: Backup configuration files
+          copy:
+            src: "{{ item.path }}/conf/"
+            dest: "{{ tomcat_backup_dir }}/{{ item.name }}_conf/"
+            remote_src: yes
+          loop: "{{ upgrades_to_perform | default([]) }}"
+
+        - name: Backup webapps directory
+          copy:
+            src: "{{ item.path }}/webapps/"
+            dest: "{{ tomcat_backup_dir }}/{{ item.name }}_webapps/"
+            remote_src: yes
+          loop: "{{ upgrades_to_perform | default([]) }}"
+
+        - name: Check for shared-config symlink
+          stat:
+            path: "{{ item.path }}/shared-config"
+          register: shared_config_stat
+          loop: "{{ upgrades_to_perform | default([]) }}"
+
+        - name: Store shared-config symlink information
+          set_fact:
+            shared_config_symlinks: "{{ shared_config_symlinks | default([]) + [symlink_info] }}"
+          loop: "{{ upgrades_to_perform | default([]) }}"
+          loop_control:
+            index_var: index
+          when: 
+            - shared_config_stat.results is defined
+            - index < (shared_config_stat.results | length)
+            - shared_config_stat.results[index].stat.exists
+            - shared_config_stat.results[index].stat.islnk
+          vars:
+            symlink_info:
+              path: "{{ item.path }}"
+              name: "{{ item.name }}"
+              target: "{{ shared_config_stat.results[index].stat.lnk_target }}"
+              exists: true
+
+        - name: Display shared-config symlink detection results
+          debug:
+            msg: |
+              Detected shared-config symlinks that will be preserved:
+              {% for symlink in shared_config_symlinks | default([]) %}
+              - {{ symlink.path }}/shared-config -> {{ symlink.target }}
+              {% endfor %}
+              These symlinks will be recreated after the upgrade.
+          when: shared_config_symlinks is defined and shared_config_symlinks | length > 0
+
+        - name: Remove old Tomcat files (keep conf and webapps)
+          shell: |
+            cd "{{ item.path }}"
+            find . -mindepth 1 -maxdepth 1 -not -name 'conf' -not -name 'webapps' -not -name 'logs' -exec rm -rf {} +
+          loop: "{{ upgrades_to_perform | default([]) }}"
+
+        - name: Copy new Tomcat files
+          shell: |
+            cd "/tmp/apache-tomcat-{{ tomcat_latest_version }}"
+            find . -mindepth 1 -maxdepth 1 -not -name 'conf' -not -name 'webapps' -exec cp -r {} "{{ item.path }}/" \;
+          loop: "{{ upgrades_to_perform | default([]) }}"
+
+        - name: Recreate shared-config symlinks
+          block:
+            - name: Remove any existing shared-config directory from new installation
+              file:
+                path: "{{ item.path }}/shared-config"
+                state: absent
+              loop: "{{ shared_config_symlinks | default([]) }}"
+              when: shared_config_symlinks is defined
+
+            - name: Recreate shared-config symlinks
+              file:
+                src: "{{ item.target }}"
+                dest: "{{ item.path }}/shared-config"
+                state: link
+                force: yes
+              loop: "{{ shared_config_symlinks | default([]) }}"
+              when: shared_config_symlinks is defined
+              register: symlink_recreation
+              ignore_errors: yes
+
+            - name: Verify shared-config symlinks were recreated
+              stat:
+                path: "{{ item.path }}/shared-config"
+              register: symlink_verification
+              loop: "{{ shared_config_symlinks | default([]) }}"
+              when: shared_config_symlinks is defined
+
+            - name: Display symlink recreation results
+              debug:
+                msg: |
+                  Shared-config symlink recreation for {{ item.item.name }}:
+                  - Path: {{ item.item.path }}/shared-config
+                  - Target: {{ item.item.target }}
+                  - Status: {{ 'Success' if item.stat.exists and item.stat.islnk else 'Failed' }}
+                  - Target exists: {{ 'Yes' if item.stat.exists and item.stat.islnk else 'No' }}
+              loop: "{{ symlink_verification.results | default([]) }}"
+              when: 
+                - symlink_verification.results is defined
+                - shared_config_symlinks is defined
+
+            - name: Create shared-config directory if symlink target doesn't exist
+              file:
+                path: "{{ item.path | dirname }}/shared-config"
+                state: directory
+                mode: '0755'
+                owner: "{{ tomcat_user }}"
+                group: "{{ tomcat_group }}"
+              loop: "{{ shared_config_symlinks | default([]) }}"
+              when: 
+                - shared_config_symlinks is defined
+                - symlink_recreation is defined
+                - symlink_recreation.failed is defined
+                - symlink_recreation.failed
+              ignore_errors: yes
+
+            - name: Retry symlink creation after directory creation
+              file:
+                src: "{{ item.path | dirname }}/shared-config"
+                dest: "{{ item.path }}/shared-config"
+                state: link
+                force: yes
+              loop: "{{ shared_config_symlinks | default([]) }}"
+              when: 
+                - shared_config_symlinks is defined
+                - symlink_recreation is defined
+                - symlink_recreation.failed is defined
+                - symlink_recreation.failed
+              ignore_errors: yes
+
+          when: shared_config_symlinks is defined and shared_config_symlinks | length > 0
+
+        - name: Update file permissions
+          file:
+            path: "{{ item.path }}"
+            owner: "{{ tomcat_user }}"
+            group: "{{ tomcat_group }}"
+            recurse: yes
+          loop: "{{ upgrades_to_perform | default([]) }}"
+          ignore_errors: yes
+
+        - name: Make shell scripts executable
+          file:
+            path: "{{ item.0.path }}/bin/{{ item.1 }}"
+            mode: '0755'
+          with_nested:
+            - "{{ upgrades_to_perform | default([]) }}"
+            - ["catalina.sh", "startup.sh", "shutdown.sh", "version.sh"]
+          ignore_errors: yes
+
+      when: 
+        - upgrades_to_perform is defined 
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+
+    - name: Start Tomcat services
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop: "{{ tomcat_services.stdout_lines | default([]) }}"
+      when: 
+        - tomcat_services.stdout_lines is defined
+        - skip_upgrade is not defined
+      ignore_errors: yes
+
+    - name: Start Tomcat manually if no systemd service
+      shell: |
+        cd "{{ item.path }}"
+        ./bin/startup.sh
+      loop: "{{ upgrades_to_perform | default([]) }}"
+      when: 
+        - upgrades_to_perform is defined
+        - (tomcat_services.stdout_lines is not defined or tomcat_services.stdout_lines | length == 0)
+        - skip_upgrade is not defined
+
+    - name: Wait for Tomcat to start on configured ports
+      wait_for:
+        port: "{{ port }}"
+        host: "{{ ansible_default_ipv4.address }}"
+        timeout: 60
+      loop: "{{ upgrades_to_perform | default([]) | map(attribute='running_ports') | flatten | unique }}"
+      loop_control:
+        loop_var: port
+      when: 
+        - upgrades_to_perform is defined
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+      register: tomcat_startup_check
+      ignore_errors: yes
+
+    - name: Check if Tomcat is responding on original ports
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:{{ port }}"
+        method: GET
+        status_code: [200, 404]  # 404 is OK for default Tomcat page
+        timeout: 10
+      loop: "{{ upgrades_to_perform | default([]) | map(attribute='running_ports') | flatten | unique }}"
+      loop_control:
+        loop_var: port
+      when: 
+        - upgrades_to_perform is defined
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+      register: tomcat_http_check
+      ignore_errors: yes
+
+    - name: Verify upgrade success
+      shell: |
+        cd "{{ item.path }}"
+        ./bin/version.sh | grep "Server version"
+      register: upgrade_verification
+      loop: "{{ upgrades_to_perform | default([]) }}"
+      when: 
+        - upgrades_to_perform is defined
+        - skip_upgrade is not defined
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Check if rollback is needed
+      set_fact:
+        rollback_needed: true
+      when: 
+        - tomcat_startup_check is defined
+        - tomcat_startup_check.failed is defined 
+        - tomcat_startup_check.failed
+        - tomcat_http_check is defined
+        - tomcat_http_check.failed is defined
+        - tomcat_http_check.failed
+
+    - name: Rollback if startup failed
+      block:
+        - name: Display rollback warning
+          debug:
+            msg: |
+              ROLLBACK INITIATED: Tomcat failed to start after upgrade
+              Rolling back to previous version...
+
+        - name: Stop failed Tomcat installation
+          shell: |
+            cd "{{ item.path }}"
+            ./bin/shutdown.sh || true
+            sleep 5
+            pkill -f "{{ item.path }}" || true
+          loop: "{{ upgrades_to_perform | default([]) }}"
+          ignore_errors: yes
+
+        - name: Remove failed upgrade files
+          shell: |
+            cd "{{ item.path }}"
+            find . -mindepth 1 -maxdepth 1 -not -name 'conf' -not -name 'webapps' -not -name 'logs' -exec rm -rf {} +
+          loop: "{{ upgrades_to_perform | default([]) }}"
+
+        - name: Restore from backup
+          unarchive:
+            src: "{{ tomcat_backup_dir }}/{{ item.name }}/tomcat_backup_{{ item.name }}_{{ ansible_date_time.epoch }}.tar"
+            dest: "{{ item.path | dirname }}"
+            remote_src: yes
+          loop: "{{ upgrades_to_perform | default([]) }}"
+
+        - name: Update file permissions after rollback
+          file:
+            path: "{{ item.path }}"
+            owner: "{{ tomcat_user }}"
+            group: "{{ tomcat_group }}"
+            recurse: yes
+          loop: "{{ upgrades_to_perform | default([]) }}"
+          ignore_errors: yes
+
+        - name: Start restored Tomcat services
+          systemd:
+            name: "{{ item }}"
+            state: started
+            enabled: yes
+          loop: "{{ tomcat_services.stdout_lines | default([]) }}"
+          when: tomcat_services.stdout_lines is defined
+          ignore_errors: yes
+
+        - name: Start restored Tomcat manually if no systemd service
+          shell: |
+            cd "{{ item.path }}"
+            ./bin/startup.sh
+          loop: "{{ upgrades_to_perform | default([]) }}"
+          when: 
+            - upgrades_to_perform is defined
+            - (tomcat_services.stdout_lines is not defined or tomcat_services.stdout_lines | length == 0)
+
+        - name: Wait for restored Tomcat to start
+          wait_for:
+            port: "{{ port }}"
+            host: "{{ ansible_default_ipv4.address }}"
+            timeout: 60
+          loop: "{{ upgrades_to_perform | default([]) | map(attribute='running_ports') | flatten | unique }}"
+          loop_control:
+            loop_var: port
+          when: 
+            - upgrades_to_perform is defined
+            - upgrades_to_perform | length > 0
+          ignore_errors: yes
+
+        - name: Verify rollback success
+          shell: |
+            cd "{{ item.path }}"
+            ./bin/version.sh | grep "Server version"
+          register: rollback_verification
+          loop: "{{ upgrades_to_perform | default([]) }}"
+          ignore_errors: yes
+          changed_when: false
+
+        - name: Display rollback results
+          debug:
+            msg: |
+              Rollback completed for {{ item.item.name }}:
+              - Path: {{ item.item.path }}
+              - Restored version: {{ item.stdout | default('Rollback verification failed') }}
+          loop: "{{ rollback_verification.results | default([]) }}"
+          when: rollback_verification.results is defined
+
+        - name: Fail playbook after rollback
+          fail:
+            msg: |
+              Tomcat upgrade failed and has been rolled back to previous version.
+              Please check the logs and resolve any issues before retrying the upgrade.
+              Original backups are still available in {{ tomcat_backup_dir }}
+
+      when: rollback_needed is defined and rollback_needed
+
+    - name: Display upgrade results
+      debug:
+        msg: |
+          Tomcat installation upgrade completed:
+          - Path: {{ item.item.path }}
+          - Name: {{ item.item.name }}
+          - New version: {{ item.stdout | default('Verification failed') }}
+          - Previously was running: {{ item.item.is_running }}
+          {% if item.item.is_running %}
+          - Previously running on ports: {{ item.item.running_ports | join(', ') }}
+          {% endif %}
+      loop: "{{ upgrade_verification.results | default([]) }}"
+      when: 
+        - upgrade_verification.results is defined
+        - rollback_needed is not defined or not rollback_needed
+
+    - name: Remove Windows batch files from Linux installations
+      shell: |
+        cd "{{ item.path }}"
+        find . -type f -name "*.bat" -delete
+        echo "Removed Windows .bat files"
+      loop: "{{ upgrades_to_perform | default([]) }}"
+      when: 
+        - upgrades_to_perform is defined 
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+      ignore_errors: yes
+
+    - name: Remove README and LICENSE files
+      shell: |
+        cd "{{ item.path }}"
+        find . -maxdepth 1 -type f \( -iname "readme*" -o -iname "license*" -o -iname "notice*" -o -iname "release-notes*" \) -delete
+        echo "Removed documentation files"
+      loop: "{{ upgrades_to_perform | default([]) }}"
+      when: 
+        - upgrades_to_perform is defined 
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+      ignore_errors: yes
+
+    - name: Clean up downloaded files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+        - "/tmp/apache-tomcat-{{ tomcat_latest_version }}"
+      when: 
+        - upgrades_to_perform is defined 
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+
+    - name: Display backup information
+      debug:
+        msg: |
+          Backup created at: {{ tomcat_backup_dir }}
+          This backup contains:
+          - Full backup of original Tomcat installations
+          - Configuration files
+          - Web applications
+          - Process and port information
+          Please keep this backup until you verify the upgrade is successful.
+      when: 
+        - upgrades_to_perform is defined 
+        - upgrades_to_perform | length > 0
+        - skip_upgrade is not defined
+
+    - name: Final summary
+      debug:
+        msg: |
+          Tomcat 9 upgrade completed successfully!
+          
+          Summary:
+          - Found {{ tomcat_installations | default([]) | length }} total Tomcat installations
+          - Found {{ tomcat9_installations | default([]) | length }} Tomcat 9 installations
+          - Upgraded {{ upgrades_to_perform | default([]) | length }} installations to version {{ tomcat_latest_version }}
+          - Stopped {{ running_upgrades | default([]) | length }} running instances during upgrade
+          - Backups stored in {{ tomcat_backup_dir }}
+          
+          Details:
+          {% for upgrade in upgrades_to_perform | default([]) %}
+          - {{ upgrade.path }}: {{ upgrade.version }} → {{ tomcat_latest_version }}
+            {% if upgrade.is_running %}(was running on ports: {{ upgrade.running_ports | join(', ') }}){% endif %}
+          {% endfor %}
+          
+          Please verify your applications are working correctly on the original ports.
+      when: 
+        - upgrades_to_perform is defined 
+        - upgrades_to_perform | length > 0
+        - rollback_needed is not defined or not rollback_needed
+        - skip_upgrade is not defined

@@ -1,0 +1,1793 @@
+---
+- name: Generate Tomcat Installation Report
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    report_dir: "/tmp/tomcat_report_{{ ansible_date_time.epoch }}"
+    report_filename: "tomcat_installations_report_{{ ansible_date_time.date }}.html"
+    email_to: "to"  # Set via -e email_to=admin@example.com
+    email_from: "from"
+    email_subject: "Tomcat Installation Report - {{ ansible_date_time.date }}"
+    
+  tasks:
+    - name: Create report directory
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Find Tomcat installations by running processes
+      shell: |
+        ps aux | grep -i catalina | grep -v grep | awk '{print $2}' | while read pid; do
+          if [ -n "$pid" ]; then
+            readlink -f /proc/$pid/exe 2>/dev/null || echo "unknown"
+          fi
+        done | sort -u
+      register: tomcat_processes
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Find Tomcat installations in common directories
+      find:
+        paths:
+          - /opt
+          - /usr/local
+          - /home
+          - /var/lib
+        patterns:
+          - "tomcat*"
+          - "apache-tomcat*"
+        file_type: directory
+        recurse: no
+      register: tomcat_directories
+      ignore_errors: yes
+
+    - name: Find Tomcat binary locations
+      shell: |
+        find /opt /usr/local /home /var/lib -name "catalina.sh" -type f 2>/dev/null | head -20
+      register: tomcat_binaries
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Check systemd services
+      shell: |
+        systemctl list-units --type=service --all | grep -i tomcat | awk '{print $1}'
+      register: tomcat_services
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Combine and deduplicate Tomcat installations
+      set_fact:
+        potential_tomcat_dirs: "{{ (tomcat_directories.files | map(attribute='path') | list) + (tomcat_binaries.stdout_lines | map('dirname') | map('dirname') | list) }}"
+
+    - name: Filter valid Tomcat installations
+      set_fact:
+        valid_tomcat_dirs: "{{ valid_tomcat_dirs | default([]) + [item] }}"
+      loop: "{{ potential_tomcat_dirs | unique }}"
+      when: 
+        - item is defined
+        - item != ""
+      vars:
+        tomcat_check: "{{ ansible_stat }}"
+
+    - name: Check for Java availability and install if needed
+      block:
+        - name: Check if Java is available
+          shell: |
+            # Check for Java in various locations
+            if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+              echo "found:$JAVA_HOME/bin/java"
+            elif command -v java >/dev/null 2>&1; then
+              echo "found:$(command -v java)"
+            elif [ -x "/usr/bin/java" ]; then
+              echo "found:/usr/bin/java"
+            elif [ -x "/usr/local/bin/java" ]; then
+              echo "found:/usr/local/bin/java"
+            else
+              echo "not_found"
+            fi
+          register: java_check
+          ignore_errors: yes
+          changed_when: false
+
+        - name: Install Java temporarily if not found
+          block:
+            - name: Detect OS and install Java
+              shell: |
+                if [ -f /etc/redhat-release ] || [ -f /etc/centos-release ]; then
+                  # RHEL/CentOS
+                  echo "Installing Java on RHEL/CentOS..."
+                  yum install -y java-1.8.0-openjdk 2>/dev/null || yum install -y java-11-openjdk 2>/dev/null || echo "Java installation failed"
+                elif [ -f /etc/debian_version ]; then
+                  # Debian/Ubuntu
+                  echo "Installing Java on Debian/Ubuntu..."
+                  apt-get update -qq 2>/dev/null
+                  apt-get install -y openjdk-8-jdk 2>/dev/null || apt-get install -y openjdk-11-jdk 2>/dev/null || echo "Java installation failed"
+                elif [ -f /etc/arch-release ]; then
+                  # Arch Linux
+                  echo "Installing Java on Arch Linux..."
+                  pacman -S --noconfirm jdk8-openjdk 2>/dev/null || pacman -S --noconfirm jdk11-openjdk 2>/dev/null || echo "Java installation failed"
+                elif [ -f /etc/alpine-release ]; then
+                  # Alpine Linux
+                  echo "Installing Java on Alpine Linux..."
+                  apk add --no-cache openjdk8 2>/dev/null || apk add --no-cache openjdk11 2>/dev/null || echo "Java installation failed"
+                elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
+                  # SUSE
+                  echo "Installing Java on SUSE..."
+                  zypper install -y java-1_8_0-openjdk 2>/dev/null || zypper install -y java-11-openjdk 2>/dev/null || echo "Java installation failed"
+                else
+                  echo "Unknown OS, cannot install Java automatically"
+                fi
+              register: java_install
+              ignore_errors: yes
+              changed_when: false
+              when: java_check.stdout == "not_found"
+
+            - name: Verify Java installation
+              shell: |
+                if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+                  echo "found:$JAVA_HOME/bin/java"
+                elif command -v java >/dev/null 2>&1; then
+                  echo "found:$(command -v java)"
+                elif [ -x "/usr/bin/java" ]; then
+                  echo "found:/usr/bin/java"
+                elif [ -x "/usr/local/bin/java" ]; then
+                  echo "found:/usr/local/bin/java"
+                else
+                  echo "not_found"
+                fi
+              register: java_recheck
+              ignore_errors: yes
+              changed_when: false
+              when: java_check.stdout == "not_found"
+
+            - name: Set Java installation flag
+              set_fact:
+                java_was_installed: true
+              when: 
+                - java_check.stdout == "not_found"
+                - java_recheck is defined
+                - java_recheck.stdout != "not_found"
+
+          when: java_check.stdout == "not_found"
+
+    - name: Get Tomcat version information
+      block:
+        - name: Check for version.sh script
+          stat:
+            path: "{{ item }}/bin/version.sh"
+          register: version_script_check
+          loop: "{{ valid_tomcat_dirs | default([]) }}"
+
+        - name: Get Tomcat version using enhanced detection with permission handling
+          shell: |
+            TOMCAT_DIR="{{ item.item }}"
+            echo "DEBUG: Checking Tomcat directory: $TOMCAT_DIR" >&2
+            
+            # Function to get Java command
+            get_java_cmd() {
+              if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+                echo "$JAVA_HOME/bin/java"
+              elif command -v java >/dev/null 2>&1; then
+                echo "java"
+              elif [ -x "/usr/bin/java" ]; then
+                echo "/usr/bin/java"
+              elif [ -x "/usr/local/bin/java" ]; then
+                echo "/usr/local/bin/java"
+              else
+                echo ""
+              fi
+            }
+            
+            # Function to check directory permissions
+            check_permissions() {
+              local dir="$1"
+              if [ ! -d "$dir" ]; then
+                echo "DEBUG: Directory $dir does not exist" >&2
+                return 1
+              fi
+              if [ ! -r "$dir" ]; then
+                echo "DEBUG: No read permission for directory $dir" >&2
+                return 1
+              fi
+              return 0
+            }
+            
+            # Function to check file permissions
+            check_file_permissions() {
+              local file="$1"
+              if [ ! -f "$file" ]; then
+                echo "DEBUG: File $file does not exist" >&2
+                return 1
+              fi
+              if [ ! -r "$file" ]; then
+                echo "DEBUG: No read permission for file $file" >&2
+                return 1
+              fi
+              return 0
+            }
+            
+            # Check base directory permissions
+            if ! check_permissions "$TOMCAT_DIR"; then
+              echo "Version: Unknown (permission denied - $TOMCAT_DIR)"
+              exit 0
+            fi
+            
+            # Method 1: Try version.sh with permission checks
+            if [ -f "$TOMCAT_DIR/bin/version.sh" ]; then
+              echo "DEBUG: Found version.sh, checking permissions" >&2
+              if check_permissions "$TOMCAT_DIR/bin" && check_file_permissions "$TOMCAT_DIR/bin/version.sh"; then
+                if [ -x "$TOMCAT_DIR/bin/version.sh" ]; then
+                  echo "DEBUG: version.sh is executable, attempting to run" >&2
+                  cd "$TOMCAT_DIR/bin" 2>/dev/null || {
+                    echo "DEBUG: Cannot change to $TOMCAT_DIR/bin directory" >&2
+                    echo "Version: Unknown (permission denied - bin directory)"
+                    exit 0
+                  }
+                  VERSION=$(./version.sh 2>/dev/null | grep "Server version" | head -1 | sed 's/Server version: //')
+                  if [ -n "$VERSION" ]; then
+                    echo "$VERSION"
+                    exit 0
+                  else
+                    echo "DEBUG: version.sh exists but failed to get version (possibly permission issue)" >&2
+                  fi
+                else
+                  echo "DEBUG: version.sh exists but is not executable" >&2
+                fi
+              else
+                echo "DEBUG: version.sh exists but permission denied" >&2
+              fi
+            fi
+            
+            # Method 2: Try catalina.sh with permission checks
+            if [ -f "$TOMCAT_DIR/bin/catalina.sh" ]; then
+              echo "DEBUG: Found catalina.sh, checking permissions" >&2
+              if check_permissions "$TOMCAT_DIR/bin" && check_file_permissions "$TOMCAT_DIR/bin/catalina.sh"; then
+                if [ -x "$TOMCAT_DIR/bin/catalina.sh" ]; then
+                  echo "DEBUG: catalina.sh is executable, attempting to run" >&2
+                  cd "$TOMCAT_DIR/bin" 2>/dev/null || {
+                    echo "DEBUG: Cannot change to $TOMCAT_DIR/bin directory" >&2
+                    echo "Version: Unknown (permission denied - bin directory)"
+                    exit 0
+                  }
+                  VERSION=$(./catalina.sh version 2>/dev/null | grep "Server version" | head -1 | sed 's/Server version: //')
+                  if [ -n "$VERSION" ]; then
+                    echo "$VERSION"
+                    exit 0
+                  else
+                    echo "DEBUG: catalina.sh exists but failed to get version (possibly permission issue)" >&2
+                  fi
+                else
+                  echo "DEBUG: catalina.sh exists but is not executable" >&2
+                fi
+              else
+                echo "DEBUG: catalina.sh exists but permission denied" >&2
+              fi
+            fi
+            
+            # Method 3: Try Java-based version detection with permission checks
+            if check_permissions "$TOMCAT_DIR/lib" && check_file_permissions "$TOMCAT_DIR/lib/catalina.jar"; then
+              echo "DEBUG: Found catalina.jar, trying Java method" >&2
+              cd "$TOMCAT_DIR/lib" 2>/dev/null || {
+                echo "DEBUG: Cannot change to $TOMCAT_DIR/lib directory" >&2
+                echo "Version: Unknown (permission denied - lib directory)"
+                exit 0
+              }
+              JAVA_CMD=$(get_java_cmd)
+              
+              if [ -n "$JAVA_CMD" ]; then
+                echo "DEBUG: Using Java: $JAVA_CMD" >&2
+                VERSION=$($JAVA_CMD -cp catalina.jar org.apache.catalina.util.ServerInfo 2>/dev/null | grep "Server version" | head -1 | sed 's/Server version: //')
+                if [ -n "$VERSION" ]; then
+                  echo "$VERSION"
+                  exit 0
+                else
+                  echo "DEBUG: Java method failed (possibly permission issue)" >&2
+                fi
+              else
+                echo "DEBUG: No Java executable found" >&2
+              fi
+              
+              # Method 4: Try manifest extraction with permission checks
+              echo "DEBUG: Trying manifest extraction method" >&2
+              if command -v unzip >/dev/null 2>&1; then
+                VERSION=$(unzip -q -c catalina.jar META-INF/MANIFEST.MF 2>/dev/null | grep "Implementation-Version" | cut -d: -f2 | tr -d ' ' | head -1)
+                if [ -n "$VERSION" ]; then
+                  echo "Apache Tomcat/$VERSION"
+                  exit 0
+                else
+                  echo "DEBUG: Manifest extraction failed" >&2
+                fi
+              else
+                echo "DEBUG: unzip command not available" >&2
+              fi
+            else
+              echo "DEBUG: catalina.jar not accessible (permission denied)" >&2
+            fi
+            
+            # Method 5: Try alternative manifest extraction using jar command
+            if command -v jar >/dev/null 2>&1 && check_file_permissions "$TOMCAT_DIR/lib/catalina.jar"; then
+              echo "DEBUG: Trying jar command for manifest extraction" >&2
+              cd "$TOMCAT_DIR/lib" 2>/dev/null || {
+                echo "DEBUG: Cannot change to $TOMCAT_DIR/lib directory" >&2
+                echo "Version: Unknown (permission denied - lib directory)"
+                exit 0
+              }
+              VERSION=$(jar -tf catalina.jar | grep -q "META-INF/MANIFEST.MF" && jar -xf catalina.jar META-INF/MANIFEST.MF 2>/dev/null && grep "Implementation-Version" META-INF/MANIFEST.MF 2>/dev/null | cut -d: -f2 | tr -d ' ' | head -1)
+              if [ -n "$VERSION" ]; then
+                rm -f META-INF/MANIFEST.MF 2>/dev/null
+                rmdir META-INF 2>/dev/null
+                echo "Apache Tomcat/$VERSION"
+                exit 0
+              else
+                echo "DEBUG: jar command manifest extraction failed" >&2
+                rm -f META-INF/MANIFEST.MF 2>/dev/null
+                rmdir META-INF 2>/dev/null
+              fi
+            fi
+            
+            # Method 6: Try to extract version from server.xml comments (sometimes contains version info)
+            if check_file_permissions "$TOMCAT_DIR/conf/server.xml"; then
+              echo "DEBUG: Trying to extract version from server.xml" >&2
+              VERSION=$(grep -i "apache.*tomcat" "$TOMCAT_DIR/conf/server.xml" 2>/dev/null | head -1 | sed -n 's/.*[Tt]omcat[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+              if [ -n "$VERSION" ]; then
+                echo "Apache Tomcat/$VERSION (extracted from server.xml)"
+                exit 0
+              else
+                echo "DEBUG: No version found in server.xml" >&2
+              fi
+            else
+              echo "DEBUG: server.xml not accessible (permission denied)" >&2
+            fi
+            
+            # Method 7: Try to extract version from directory name
+            echo "DEBUG: Trying to extract version from directory name" >&2
+            DIR_NAME=$(basename "$TOMCAT_DIR")
+            VERSION=$(echo "$DIR_NAME" | sed -n 's/.*[Tt]omcat[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+            if [ -n "$VERSION" ]; then
+              echo "Apache Tomcat/$VERSION (extracted from directory name)"
+              exit 0
+            else
+              echo "DEBUG: No version found in directory name: $DIR_NAME" >&2
+            fi
+            
+            # All methods failed - provide detailed failure reason
+            echo "DEBUG: All version detection methods failed for $TOMCAT_DIR" >&2
+            if [ ! -r "$TOMCAT_DIR" ]; then
+              echo "Version: Unknown (permission denied - directory not readable)"
+            elif [ ! -r "$TOMCAT_DIR/bin" ] && [ ! -r "$TOMCAT_DIR/lib" ]; then
+              echo "Version: Unknown (permission denied - bin and lib directories not readable)"
+            elif [ ! -r "$TOMCAT_DIR/bin" ]; then
+              echo "Version: Unknown (permission denied - bin directory not readable)"
+            elif [ ! -r "$TOMCAT_DIR/lib" ]; then
+              echo "Version: Unknown (permission denied - lib directory not readable)"
+            else
+              echo "Version: Unknown (all detection methods failed)"
+            fi
+          register: tomcat_versions
+          loop: "{{ version_script_check.results }}"
+          when: version_script_check.results is defined
+          ignore_errors: yes
+          changed_when: false
+
+        - name: Detect directory ownership and retry version detection with proper user context
+          script: retry_version_detection.sh "{{ item.item }}" "{{ item.stdout }}"
+          register: tomcat_versions_retry
+          loop: "{{ tomcat_versions.results }}"
+          when: 
+            - tomcat_versions.results is defined
+            - item.stdout is defined
+            - item.stdout | regex_search('permission denied')
+          ignore_errors: yes
+          changed_when: false
+
+        - name: Merge original and retry version results
+          set_fact:
+            tomcat_versions_final: "{{ tomcat_versions_final | default([]) + [final_version] }}"
+          loop: "{{ tomcat_versions.results }}"
+          loop_control:
+            index_var: index
+          when: tomcat_versions.results is defined
+          vars:
+            retry_result: "{{ (tomcat_versions_retry.results[index] if tomcat_versions_retry.results is defined and index < (tomcat_versions_retry.results | length) else {}) }}"
+            final_version: "{{ retry_result.stdout if retry_result.stdout is defined and retry_result.stdout != '' else item.stdout }}"
+
+        - name: Set final Tomcat versions
+          set_fact:
+            tomcat_versions: "{{ tomcat_versions_final }}"
+          when: tomcat_versions_final is defined
+
+    - name: Get Tomcat process status
+      shell: |
+        ps aux | grep -i "{{ item }}" | grep -v grep | wc -l
+      register: tomcat_status
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Check Tomcat configured ports from server.xml
+      shell: |
+        if [ -f "{{ item }}/conf/server.xml" ]; then
+          grep -E "port=\"[0-9]+\"" "{{ item }}/conf/server.xml" | head -3 | sed 's/.*port="\([0-9]*\)".*/\1/' | tr '\n' ', ' | sed 's/,$//'
+        else
+          echo "8080,8005,8009"
+        fi
+      register: tomcat_configured_ports
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Detect actual running ports for each Tomcat installation
+      shell: |
+        # Find processes running from this Tomcat installation
+        TOMCAT_DIR="{{ item }}"
+        RUNNING_PORTS=""
+        
+        # Look for java processes with this Tomcat directory in command line
+        for pid in $(ps aux | grep java | grep -i catalina | grep "$TOMCAT_DIR" | grep -v grep | awk '{print $2}'); do
+          if [ -n "$pid" ]; then
+            # Get ports this process is listening on
+            PORTS=$(netstat -tlnp 2>/dev/null | grep "$pid/" | awk '{print $4}' | sed 's/.*://' | sort -n | tr '\n' ',' | sed 's/,$//')
+            if [ -n "$PORTS" ]; then
+              RUNNING_PORTS="$RUNNING_PORTS$PORTS,"
+            fi
+          fi
+        done
+        
+        # Also check using lsof if available
+        if command -v lsof >/dev/null 2>&1; then
+          for pid in $(ps aux | grep java | grep -i catalina | grep "$TOMCAT_DIR" | grep -v grep | awk '{print $2}'); do
+            if [ -n "$pid" ]; then
+              LSOF_PORTS=$(lsof -Pan -p $pid -i 2>/dev/null | grep LISTEN | awk -F: '{print $2}' | awk '{print $1}' | sort -n | tr '\n' ',' | sed 's/,$//')
+              if [ -n "$LSOF_PORTS" ]; then
+                RUNNING_PORTS="$RUNNING_PORTS$LSOF_PORTS,"
+              fi
+            fi
+          done
+        fi
+        
+        # Remove duplicates and format
+        if [ -n "$RUNNING_PORTS" ]; then
+          echo "$RUNNING_PORTS" | tr ',' '\n' | sort -nu | tr '\n' ',' | sed 's/,$//'
+        else
+          echo "Not Running"
+        fi
+      register: tomcat_actual_ports
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Get working directory for each Tomcat installation
+      shell: |
+        TOMCAT_DIR="{{ item }}"
+        WORKING_DIR="Not Running"
+        
+        # Find processes running from this Tomcat installation
+        for pid in $(ps aux | grep java | grep -i catalina | grep "$TOMCAT_DIR" | grep -v grep | awk '{print $2}'); do
+          if [ -n "$pid" ]; then
+            # Get working directory of the process
+            if [ -L "/proc/$pid/cwd" ]; then
+              WORKING_DIR=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+              break
+            fi
+          fi
+        done
+        
+        echo "$WORKING_DIR"
+      register: tomcat_working_dirs
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Get installation size
+      shell: |
+        du -sh "{{ item }}" 2>/dev/null | awk '{print $1}'
+      register: tomcat_sizes
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Get last modified date
+      stat:
+        path: "{{ item }}"
+      register: tomcat_modified
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+
+    - name: Detect database connections for running Tomcat installations
+      shell: |
+        TOMCAT_DIR="{{ item }}"
+        DATABASE_INFO="Unknown|Unknown|Unknown|Unknown|Unknown"
+        
+        # Check if this Tomcat installation is running
+        RUNNING_PIDS=$(ps aux | grep java | grep -i catalina | grep "$TOMCAT_DIR" | grep -v grep | awk '{print $2}')
+        
+        # Always check for database configuration files, whether running or not
+        echo "DEBUG: Checking database configuration for $TOMCAT_DIR" >&2
+        
+        # Create temporary files to collect database information
+        TEMP_DIR="/tmp/tomcat_db_detect_$$"
+        mkdir -p "$TEMP_DIR"
+        
+        DB_TYPES_FILE="$TEMP_DIR/db_types"
+        DB_SCHEMAS_FILE="$TEMP_DIR/db_schemas"
+        DB_DRIVERS_FILE="$TEMP_DIR/db_drivers"
+        DB_HOSTNAMES_FILE="$TEMP_DIR/db_hostnames"
+        DB_USERS_FILE="$TEMP_DIR/db_users"
+        
+        if [ -n "$RUNNING_PIDS" ]; then
+          echo "DEBUG: Tomcat is running with PIDs: $RUNNING_PIDS" >&2
+        else
+          echo "DEBUG: Tomcat is not running, but checking configuration files" >&2
+        fi
+          
+          # Function to extract database info from properties files
+          extract_db_info() {
+            local file="$1"
+            local file_type="$2"
+            
+            if [ -f "$file" ] && [ -r "$file" ]; then
+              echo "DEBUG: Scanning $file_type: $file" >&2
+              
+              # Look for JDBC URLs, drivers, and users
+              while IFS= read -r line; do
+                # Skip comments and empty lines
+                case "$line" in
+                  \#*|"") continue ;;
+                esac
+                
+                # Extract JDBC URL patterns
+                JDBC_URL=""
+                case "$line" in
+                  *jdbc.url*=*|*jdbc.URL*=*|*url*=*jdbc:*|*spring.datasource.url*=*)
+                    JDBC_URL=$(echo "$line" | sed -n 's/.*=\s*\(jdbc:[^[:space:]]*\).*/\1/p')
+                    ;;
+                  *connection.url*=*|*datasource.url*=*)
+                    JDBC_URL=$(echo "$line" | sed -n 's/.*=\s*\(jdbc:[^[:space:]]*\).*/\1/p')
+                    ;;
+                esac
+                
+                # Extract database user
+                DB_USER=""
+                case "$line" in
+                  *jdbc.user*=*|*jdbc.username*=*|*user*=*|*username*=*|*spring.datasource.username*=*)
+                    DB_USER=$(echo "$line" | sed -n 's/.*=\s*\([^[:space:]]*\).*/\1/p')
+                    ;;
+                  *connection.user*=*|*datasource.user*=*)
+                    DB_USER=$(echo "$line" | sed -n 's/.*=\s*\([^[:space:]]*\).*/\1/p')
+                    ;;
+                esac
+                
+                if [ -n "$DB_USER" ] && [ "$DB_USER" != "" ]; then
+                  echo "DEBUG: Found database user: $DB_USER" >&2
+                  echo "$DB_USER" >> "$DB_USERS_FILE"
+                fi
+                
+                if [ -n "$JDBC_URL" ]; then
+                  echo "DEBUG: Found JDBC URL: $JDBC_URL" >&2
+                  
+                  # Extract database type, schema, and hostname from JDBC URL
+                  DB_TYPE=""
+                  SCHEMA=""
+                  DB_HOSTNAME=""
+                  
+                  case "$JDBC_URL" in
+                    *jdbc:mysql*)
+                      DB_TYPE="MySQL"
+                      # Extract database name from URL path
+                      SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*\/\([^?\/]*\).*/\1/p')
+                      # Extract hostname (handle multiple hosts separated by comma)
+                      DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*:\/\/\([^:\/,]*\).*/\1/p')
+                      ;;
+                    *jdbc:postgresql*)
+                      DB_TYPE="PostgreSQL"
+                      # Extract database name from URL path
+                      SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*\/\([^?\/]*\).*/\1/p')
+                      # Also check for currentSchema or searchPath parameters
+                      if echo "$JDBC_URL" | grep -q "currentSchema="; then
+                        CURRENT_SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*currentSchema=\([^&]*\).*/\1/p')
+                        if [ -n "$CURRENT_SCHEMA" ]; then
+                          SCHEMA="$SCHEMA($CURRENT_SCHEMA)"
+                        fi
+                      elif echo "$JDBC_URL" | grep -q "searchPath="; then
+                        SEARCH_PATH=$(echo "$JDBC_URL" | sed -n 's/.*searchPath=\([^&]*\).*/\1/p')
+                        if [ -n "$SEARCH_PATH" ]; then
+                          SCHEMA="$SCHEMA($SEARCH_PATH)"
+                        fi
+                      fi
+                      # Extract hostname (handle multiple hosts separated by comma)
+                      DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*:\/\/\([^:\/,]*\).*/\1/p')
+                      ;;
+                    *jdbc:oracle*)
+                      DB_TYPE="Oracle"
+                      # Oracle has multiple URL formats - detect and parse accordingly
+                      if echo "$JDBC_URL" | grep -q "@//"; then
+                        # Format: jdbc:oracle:thin:@//hostname:port/service_name
+                        SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*\/\/[^\/]*\/\([^?]*\).*/\1/p')
+                        DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\/\/\([^:\/]*\).*/\1/p')
+                      elif echo "$JDBC_URL" | grep -q "DESCRIPTION="; then
+                        # Format: jdbc:oracle:thin:@(DESCRIPTION=...)
+                        SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*SERVICE_NAME=\([^)]*\).*/\1/p')
+                        [ -z "$SCHEMA" ] && SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*SID=\([^)]*\).*/\1/p')
+                        DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*HOST=\([^)]*\).*/\1/p')
+                      elif echo "$JDBC_URL" | grep -q "@[^/]*:[0-9]*:"; then
+                        # Format: jdbc:oracle:thin:@hostname:port:sid
+                        SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*:[0-9]*:\([^?]*\).*/\1/p')
+                        DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\([^:]*\).*/\1/p')
+                      elif echo "$JDBC_URL" | grep -q "@[^/]*:[0-9]*/"; then
+                        # Format: jdbc:oracle:thin:@hostname:port/service_name
+                        SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*:[0-9]*\/\([^?]*\).*/\1/p')
+                        DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\([^:]*\).*/\1/p')
+                      else
+                        # Fallback for other formats
+                        SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*@[^:]*:[^:]*[:/]\([^?]*\).*/\1/p')
+                        DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\([^:]*\).*/\1/p')
+                      fi
+                      ;;
+                    *)
+                      # Skip other database types - only report MySQL, PostgreSQL, and Oracle
+                      DB_TYPE=""
+                      SCHEMA=""
+                      DB_HOSTNAME=""
+                      ;;
+                  esac
+                  
+                  if [ -n "$DB_TYPE" ] && [ "$DB_TYPE" != "Unknown" ]; then
+                    echo "$DB_TYPE" >> "$DB_TYPES_FILE"
+                  fi
+                  if [ -n "$SCHEMA" ] && [ "$SCHEMA" != "Unknown" ] && [ "$SCHEMA" != "" ]; then
+                    echo "$SCHEMA" >> "$DB_SCHEMAS_FILE"
+                  fi
+                  if [ -n "$DB_HOSTNAME" ] && [ "$DB_HOSTNAME" != "Unknown" ] && [ "$DB_HOSTNAME" != "" ]; then
+                    echo "$DB_HOSTNAME" >> "$DB_HOSTNAMES_FILE"
+                  fi
+                fi
+                
+                # Extract JDBC driver
+                DRIVER=""
+                case "$line" in
+                  *jdbc.driver*=*|*jdbc.driverClassName*=*|*driver*=*|*driverClassName*=*|*spring.datasource.driver-class-name*=*)
+                    DRIVER=$(echo "$line" | sed -n 's/.*=\s*\([^[:space:]]*\).*/\1/p')
+                    ;;
+                esac
+                
+                if [ -n "$DRIVER" ]; then
+                  echo "DEBUG: Found JDBC driver: $DRIVER" >&2
+                  echo "$DRIVER" >> "$DB_DRIVERS_FILE"
+                fi
+                
+              done < "$file"
+            fi
+          }
+          
+          # Function to check process command line for database info
+          check_process_cmdline() {
+            local pid="$1"
+            
+            if [ -f "/proc/$pid/cmdline" ]; then
+              local cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ')
+              echo "DEBUG: Process $pid cmdline: $cmdline" >&2
+              
+              # Look for system properties in command line
+              if echo "$cmdline" | grep -q "\-D.*jdbc"; then
+                echo "DEBUG: Found JDBC properties in command line" >&2
+                echo "$cmdline" | grep -oE '\-D[^[:space:]]*jdbc[^[:space:]]*' | while read -r prop; do
+                  echo "DEBUG: JDBC property: $prop" >&2
+                  
+                  # Extract values from -D properties
+                  if echo "$prop" | grep -q "url="; then
+                    JDBC_URL=$(echo "$prop" | sed -n 's/.*url=\(jdbc:[^[:space:]]*\).*/\1/p')
+                    if [ -n "$JDBC_URL" ]; then
+                      echo "DEBUG: Found JDBC URL in cmdline: $JDBC_URL" >&2
+                      # Process the URL similar to properties files
+                      case "$JDBC_URL" in
+                        *jdbc:mysql*)
+                          echo "MySQL" >> "$DB_TYPES_FILE"
+                          SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*\/\([^?\/]*\).*/\1/p')
+                          DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*:\/\/\([^:\/,]*\).*/\1/p')
+                          ;;
+                        *jdbc:postgresql*)
+                          echo "PostgreSQL" >> "$DB_TYPES_FILE"
+                          SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*\/\([^?\/]*\).*/\1/p')
+                          if echo "$JDBC_URL" | grep -q "currentSchema="; then
+                            CURRENT_SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*currentSchema=\([^&]*\).*/\1/p')
+                            if [ -n "$CURRENT_SCHEMA" ]; then
+                              SCHEMA="$SCHEMA($CURRENT_SCHEMA)"
+                            fi
+                          elif echo "$JDBC_URL" | grep -q "searchPath="; then
+                            SEARCH_PATH=$(echo "$JDBC_URL" | sed -n 's/.*searchPath=\([^&]*\).*/\1/p')
+                            if [ -n "$SEARCH_PATH" ]; then
+                              SCHEMA="$SCHEMA($SEARCH_PATH)"
+                            fi
+                          fi
+                          DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*:\/\/\([^:\/,]*\).*/\1/p')
+                          ;;
+                        *jdbc:oracle*)
+                          echo "Oracle" >> "$DB_TYPES_FILE"
+                          if echo "$JDBC_URL" | grep -q "@//"; then
+                            SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*\/\/[^\/]*\/\([^?]*\).*/\1/p')
+                            DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\/\/\([^:\/]*\).*/\1/p')
+                          elif echo "$JDBC_URL" | grep -q "DESCRIPTION="; then
+                            SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*SERVICE_NAME=\([^)]*\).*/\1/p')
+                            [ -z "$SCHEMA" ] && SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*SID=\([^)]*\).*/\1/p')
+                            DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*HOST=\([^)]*\).*/\1/p')
+                          elif echo "$JDBC_URL" | grep -q "@[^/]*:[0-9]*:"; then
+                            SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*:[0-9]*:\([^?]*\).*/\1/p')
+                            DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\([^:]*\).*/\1/p')
+                          elif echo "$JDBC_URL" | grep -q "@[^/]*:[0-9]*/"; then
+                            SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*:[0-9]*\/\([^?]*\).*/\1/p')
+                            DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\([^:]*\).*/\1/p')
+                          else
+                            SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*@[^:]*:[^:]*[:/]\([^?]*\).*/\1/p')
+                            DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\([^:]*\).*/\1/p')
+                          fi
+                          ;;
+                        *)
+                          # Skip other database types
+                          SCHEMA=""
+                          DB_HOSTNAME=""
+                          ;;
+                      esac
+                      
+                      # Store schema and hostname if valid
+                      if [ -n "$SCHEMA" ] && [ "$SCHEMA" != "" ]; then
+                        echo "$SCHEMA" >> "$DB_SCHEMAS_FILE"
+                      fi
+                      if [ -n "$DB_HOSTNAME" ] && [ "$DB_HOSTNAME" != "" ]; then
+                        echo "$DB_HOSTNAME" >> "$DB_HOSTNAMES_FILE"
+                      fi
+                    fi
+                  fi
+                  
+                  if echo "$prop" | grep -q "driver="; then
+                    DRIVER=$(echo "$prop" | sed -n 's/.*driver=\([^[:space:]]*\).*/\1/p')
+                    if [ -n "$DRIVER" ]; then
+                      echo "$DRIVER" >> "$DB_DRIVERS_FILE"
+                    fi
+                  fi
+                  
+                  if echo "$prop" | grep -q "user=\|username="; then
+                    DB_USER=$(echo "$prop" | sed -n 's/.*user[^=]*=\([^[:space:]]*\).*/\1/p')
+                    if [ -n "$DB_USER" ]; then
+                      echo "DEBUG: Found database user in cmdline: $DB_USER" >&2
+                      echo "$DB_USER" >> "$DB_USERS_FILE"
+                    fi
+                  fi
+                done
+              fi
+            fi
+          }
+          
+          # Check each running PID (only if Tomcat is running)
+          if [ -n "$RUNNING_PIDS" ]; then
+            for pid in $RUNNING_PIDS; do
+              echo "DEBUG: Checking PID $pid" >&2
+              check_process_cmdline "$pid"
+            done
+          fi
+          
+          # Check common configuration files and additional locations
+          CONFIG_DIRS="$TOMCAT_DIR/conf $TOMCAT_DIR/webapps/ROOT/WEB-INF/classes $TOMCAT_DIR/lib"
+          
+          # Add additional search locations for properties files
+          EXTENDED_SEARCH_DIRS="$TOMCAT_DIR/webapps $TOMCAT_DIR/shared/classes $TOMCAT_DIR/common/classes"
+          
+          # First, do a comprehensive search for properties files
+          echo "DEBUG: Performing comprehensive search for database configuration files" >&2
+          
+          # Search in standard configuration directories
+          for config_dir in $CONFIG_DIRS; do
+            if [ -d "$config_dir" ]; then
+              echo "DEBUG: Scanning configuration directory: $config_dir" >&2
+              
+              # Check .properties files
+              find "$config_dir" -name "*.properties" -type f 2>/dev/null | while read -r prop_file; do
+                extract_db_info "$prop_file" "Properties"
+              done
+              
+              # Check .xml files for Spring configuration
+              find "$config_dir" -name "*.xml" -type f 2>/dev/null | while read -r xml_file; do
+                if grep -q "jdbc:\|datasource\|dataSource" "$xml_file" 2>/dev/null; then
+                  echo "DEBUG: Found potential database config in XML: $xml_file" >&2
+                  extract_db_info "$xml_file" "XML Config"
+                fi
+              done
+              
+              # Check .yml and .yaml files for Spring Boot applications
+              find "$config_dir" -name "*.yml" -o -name "*.yaml" -type f 2>/dev/null | while read -r yaml_file; do
+                if grep -q "jdbc:\|datasource\|url:" "$yaml_file" 2>/dev/null; then
+                  echo "DEBUG: Found potential database config in YAML: $yaml_file" >&2
+                  extract_db_info "$yaml_file" "YAML Config"
+                fi
+              done
+              
+            fi
+          done
+          
+          # Extended search in webapp directories
+          for search_dir in $EXTENDED_SEARCH_DIRS; do
+            if [ -d "$search_dir" ]; then
+              echo "DEBUG: Extended search in directory: $search_dir" >&2
+              
+              # Find properties files recursively but limit depth to avoid performance issues
+              find "$search_dir" -maxdepth 3 -name "*.properties" -type f 2>/dev/null | while read -r prop_file; do
+                if grep -q "jdbc:\|datasource\|url=" "$prop_file" 2>/dev/null; then
+                  echo "DEBUG: Found database config in extended search: $prop_file" >&2
+                  extract_db_info "$prop_file" "Extended Properties"
+                fi
+              done
+              
+              # Check for common configuration file names
+              for config_file in "application.properties" "database.properties" "db.properties" "hibernate.properties" "spring.properties"; do
+                if [ -f "$search_dir/$config_file" ]; then
+                  echo "DEBUG: Found common config file: $search_dir/$config_file" >&2
+                  extract_db_info "$search_dir/$config_file" "Common Config"
+                fi
+              done
+            fi
+          done
+          
+          # Continue with existing configuration directory scanning
+          for config_dir in $CONFIG_DIRS; do
+            if [ -d "$config_dir" ]; then
+              
+              # Check context.xml files
+              find "$config_dir" -name "context.xml" -type f 2>/dev/null | while read -r ctx_file; do
+                if [ -f "$ctx_file" ] && [ -r "$ctx_file" ]; then
+                  echo "DEBUG: Scanning context.xml: $ctx_file" >&2
+                  
+                  # Extract database info from context.xml
+                  while IFS= read -r line; do
+                    if echo "$line" | grep -q 'url=.*jdbc:'; then
+                      JDBC_URL=$(echo "$line" | sed -n 's/.*url="\([^"]*\)".*/\1/p')
+                      if [ -n "$JDBC_URL" ]; then
+                        echo "DEBUG: Found JDBC URL in context.xml: $JDBC_URL" >&2
+                        
+                        # Process the URL
+                        case "$JDBC_URL" in
+                          *jdbc:mysql*)
+                            echo "MySQL" >> "$DB_TYPES_FILE"
+                            SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*\/\([^?\/]*\).*/\1/p')
+                            DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*:\/\/\([^:\/,]*\).*/\1/p')
+                            ;;
+                          *jdbc:postgresql*)
+                            echo "PostgreSQL" >> "$DB_TYPES_FILE"
+                            SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*\/\([^?\/]*\).*/\1/p')
+                            if echo "$JDBC_URL" | grep -q "currentSchema="; then
+                              CURRENT_SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*currentSchema=\([^&]*\).*/\1/p')
+                              if [ -n "$CURRENT_SCHEMA" ]; then
+                                SCHEMA="$SCHEMA($CURRENT_SCHEMA)"
+                              fi
+                            elif echo "$JDBC_URL" | grep -q "searchPath="; then
+                              SEARCH_PATH=$(echo "$JDBC_URL" | sed -n 's/.*searchPath=\([^&]*\).*/\1/p')
+                              if [ -n "$SEARCH_PATH" ]; then
+                                SCHEMA="$SCHEMA($SEARCH_PATH)"
+                              fi
+                            fi
+                            DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*:\/\/\([^:\/,]*\).*/\1/p')
+                            ;;
+                          *jdbc:oracle*)
+                            echo "Oracle" >> "$DB_TYPES_FILE"
+                            if echo "$JDBC_URL" | grep -q "@//"; then
+                              SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*\/\/[^\/]*\/\([^?]*\).*/\1/p')
+                              DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\/\/\([^:\/]*\).*/\1/p')
+                            elif echo "$JDBC_URL" | grep -q "DESCRIPTION="; then
+                              SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*SERVICE_NAME=\([^)]*\).*/\1/p')
+                              [ -z "$SCHEMA" ] && SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*SID=\([^)]*\).*/\1/p')
+                              DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*HOST=\([^)]*\).*/\1/p')
+                            elif echo "$JDBC_URL" | grep -q "@[^/]*:[0-9]*:"; then
+                              SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*:[0-9]*:\([^?]*\).*/\1/p')
+                              DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\([^:]*\).*/\1/p')
+                            elif echo "$JDBC_URL" | grep -q "@[^/]*:[0-9]*/"; then
+                              SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*:[0-9]*\/\([^?]*\).*/\1/p')
+                              DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\([^:]*\).*/\1/p')
+                            else
+                              SCHEMA=$(echo "$JDBC_URL" | sed -n 's/.*@[^:]*:[^:]*[:/]\([^?]*\).*/\1/p')
+                              DB_HOSTNAME=$(echo "$JDBC_URL" | sed -n 's/.*@\([^:]*\).*/\1/p')
+                            fi
+                            ;;
+                          *)
+                            # Skip other database types
+                            SCHEMA=""
+                            DB_HOSTNAME=""
+                            ;;
+                        esac
+                        
+                        if [ -n "$SCHEMA" ] && [ "$SCHEMA" != "" ]; then
+                          echo "$SCHEMA" >> "$DB_SCHEMAS_FILE"
+                        fi
+                        if [ -n "$DB_HOSTNAME" ] && [ "$DB_HOSTNAME" != "" ]; then
+                          echo "$DB_HOSTNAME" >> "$DB_HOSTNAMES_FILE"
+                        fi
+                      fi
+                    fi
+                    
+                    if echo "$line" | grep -q 'driverClassName='; then
+                      DRIVER=$(echo "$line" | sed -n 's/.*driverClassName="\([^"]*\)".*/\1/p')
+                      if [ -n "$DRIVER" ]; then
+                        echo "DEBUG: Found driver in context.xml: $DRIVER" >&2
+                        echo "$DRIVER" >> "$DB_DRIVERS_FILE"
+                      fi
+                    fi
+                    
+                    if echo "$line" | grep -q 'username='; then
+                      DB_USER=$(echo "$line" | sed -n 's/.*username="\([^"]*\)".*/\1/p')
+                      if [ -n "$DB_USER" ]; then
+                        echo "DEBUG: Found database user in context.xml: $DB_USER" >&2
+                        echo "$DB_USER" >> "$DB_USERS_FILE"
+                      fi
+                    fi
+                  done < "$ctx_file"
+                fi
+              done
+              
+              # Check web.xml files for datasource references
+              find "$config_dir" -name "web.xml" -type f 2>/dev/null | while read -r web_file; do
+                if [ -f "$web_file" ] && [ -r "$web_file" ]; then
+                  echo "DEBUG: Scanning web.xml: $web_file" >&2
+                  
+                  # Look for resource references
+                  if grep -q "javax.sql.DataSource" "$web_file" 2>/dev/null; then
+                    echo "DEBUG: Found DataSource reference in web.xml" >&2
+                  fi
+                fi
+              done
+            fi
+          done
+          
+          # Check webapps for additional configuration
+          if [ -d "$TOMCAT_DIR/webapps" ]; then
+            echo "DEBUG: Scanning webapps directory: $TOMCAT_DIR/webapps" >&2
+            find "$TOMCAT_DIR/webapps" -name "*.properties" -type f 2>/dev/null | head -20 | while read -r prop_file; do
+              extract_db_info "$prop_file" "Webapp Properties"
+            done
+          fi
+          
+          # Process results and format output
+          DB_TYPE_STR="Unknown"
+          DB_SCHEMA_STR="Unknown"
+          DB_DRIVER_STR="Unknown"
+          DB_HOSTNAME_STR="Unknown"
+          DB_USER_STR="Unknown"
+          
+          if [ -f "$DB_TYPES_FILE" ]; then
+            DB_TYPE_STR=$(sort -u "$DB_TYPES_FILE" | head -5 | tr '\n' ',' | sed 's/,$//')
+          fi
+          
+          if [ -f "$DB_SCHEMAS_FILE" ]; then
+            DB_SCHEMA_STR=$(sort -u "$DB_SCHEMAS_FILE" | head -5 | tr '\n' ',' | sed 's/,$//')
+          fi
+          
+          if [ -f "$DB_DRIVERS_FILE" ]; then
+            DB_DRIVER_STR=$(sort -u "$DB_DRIVERS_FILE" | head -5 | tr '\n' ',' | sed 's/,$//')
+          fi
+          
+          if [ -f "$DB_HOSTNAMES_FILE" ]; then
+            DB_HOSTNAME_STR=$(sort -u "$DB_HOSTNAMES_FILE" | head -5 | tr '\n' ',' | sed 's/,$//')
+          fi
+          
+          if [ -f "$DB_USERS_FILE" ]; then
+            DB_USER_STR=$(sort -u "$DB_USERS_FILE" | head -5 | tr '\n' ',' | sed 's/,$//')
+          fi
+          
+          # Set defaults if empty
+          [ -z "$DB_TYPE_STR" ] && DB_TYPE_STR="Unknown"
+          [ -z "$DB_SCHEMA_STR" ] && DB_SCHEMA_STR="Unknown"
+          [ -z "$DB_DRIVER_STR" ] && DB_DRIVER_STR="Unknown"
+          [ -z "$DB_HOSTNAME_STR" ] && DB_HOSTNAME_STR="Unknown"
+          [ -z "$DB_USER_STR" ] && DB_USER_STR="Unknown"
+          
+          # Format: TYPE|SCHEMA|DRIVER|HOSTNAME|USER
+          DATABASE_INFO="$DB_TYPE_STR|$DB_SCHEMA_STR|$DB_DRIVER_STR|$DB_HOSTNAME_STR|$DB_USER_STR"
+          echo "DEBUG: Final database info: $DATABASE_INFO" >&2
+          
+          # Clean up temporary files
+          rm -rf "$TEMP_DIR"
+        
+        echo "$DATABASE_INFO"
+      register: tomcat_database_info
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Get detailed database connection information
+      shell: |
+        TOMCAT_DIR="{{ item }}"
+        DETAILED_DB_INFO="Not Running"
+        
+        # Check if this Tomcat installation is running
+        RUNNING_PIDS=$(ps aux | grep java | grep -i catalina | grep "$TOMCAT_DIR" | grep -v grep | awk '{print $2}')
+        
+        if [ -n "$RUNNING_PIDS" ]; then
+          echo "DEBUG: Getting detailed DB info for $TOMCAT_DIR" >&2
+          
+          # Look for database JAR files in lib directory
+          DB_JARS=""
+          if [ -d "$TOMCAT_DIR/lib" ]; then
+            DB_JARS=$(find "$TOMCAT_DIR/lib" -name "*mysql*" -o -name "*postgresql*" -o -name "*oracle*" -o -name "*sqlserver*" -o -name "*h2*" -o -name "*hsqldb*" -o -name "*derby*" -o -name "*db2*" 2>/dev/null | xargs -I {} basename {} | tr '\n' ',' | sed 's/,$//')
+          fi
+          
+          # Check for connection pool information
+          POOL_INFO=""
+          if [ -d "$TOMCAT_DIR/conf" ]; then
+            POOL_INFO=$(find "$TOMCAT_DIR/conf" -name "*.xml" -type f -exec grep -l "maxActive\|maxTotal\|initialSize\|maxIdle" {} \; 2>/dev/null | wc -l)
+          fi
+          
+          # Check for JNDI datasource configurations
+          JNDI_DATASOURCES=""
+          if [ -d "$TOMCAT_DIR/conf" ]; then
+            JNDI_DATASOURCES=$(find "$TOMCAT_DIR/conf" -name "*.xml" -type f -exec grep -l "javax.sql.DataSource" {} \; 2>/dev/null | wc -l)
+          fi
+          
+          # Format: DB_JARS|POOL_CONFIGS|JNDI_SOURCES
+          DETAILED_DB_INFO="${DB_JARS:-None}|${POOL_INFO:-0}|${JNDI_DATASOURCES:-0}"
+        fi
+        
+        echo "$DETAILED_DB_INFO"
+      register: tomcat_detailed_db_info
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Compile installation data
+      set_fact:
+        tomcat_installations: "{{ tomcat_installations | default([]) + [installation_data] }}"
+      loop: "{{ valid_tomcat_dirs | default([]) }}"
+      loop_control:
+        index_var: index
+      when: valid_tomcat_dirs is defined and valid_tomcat_dirs | length > 0
+      vars:
+        db_info: "{{ tomcat_database_info.results[index].stdout.split('|') if tomcat_database_info.results is defined and index < (tomcat_database_info.results | length) else ['Unknown', 'Unknown', 'Unknown', 'Unknown', 'Unknown'] }}"
+        detailed_db_info: "{{ tomcat_detailed_db_info.results[index].stdout.split('|') if tomcat_detailed_db_info.results is defined and index < (tomcat_detailed_db_info.results | length) else ['None', '0', '0'] }}"
+        installation_data:
+          hostname: "{{ ansible_hostname }}"
+          fqdn: "{{ ansible_fqdn }}"
+          ip_address: "{{ ansible_default_ipv4.address }}"
+          path: "{{ item }}"
+          name: "{{ item | basename }}"
+          version: "{{ (tomcat_versions_final[index] | default('Unknown')) if tomcat_versions_final is defined and index < (tomcat_versions_final | length) else 'Unknown' }}"
+          status: "{{ 'Running' if (tomcat_status.results[index].stdout | int) > 0 else 'Stopped' }}"
+          configured_ports: "{{ tomcat_configured_ports.results[index].stdout | default('8080,8005,8009') }}"
+          actual_ports: "{{ tomcat_actual_ports.results[index].stdout | default('Not Running') }}"
+          working_directory: "{{ tomcat_working_dirs.results[index].stdout | default('Not Running') }}"
+          size: "{{ tomcat_sizes.results[index].stdout | default('Unknown') }}"
+          modified: "{{ tomcat_modified.results[index].stat.mtime | default(0) | int }}"
+          services: "{{ tomcat_services.stdout_lines | join(', ') if tomcat_services.stdout_lines is defined else 'None' }}"
+          database_type: "{{ db_info[0] if db_info | length > 0 else 'Unknown' }}"
+          database_schema: "{{ db_info[1] if db_info | length > 1 else 'Unknown' }}"
+          database_driver: "{{ db_info[2] if db_info | length > 2 else 'Unknown' }}"
+          database_hostname: "{{ db_info[3] if db_info | length > 3 else 'Unknown' }}"
+          database_user: "{{ db_info[4] if db_info | length > 4 else 'Unknown' }}"
+          database_jars: "{{ detailed_db_info[0] if detailed_db_info | length > 0 else 'None' }}"
+          connection_pools: "{{ detailed_db_info[1] if detailed_db_info | length > 1 else '0' }}"
+          jndi_datasources: "{{ detailed_db_info[2] if detailed_db_info | length > 2 else '0' }}"
+
+    - name: Ensure tomcat_installations is defined for hosts with no installations
+      set_fact:
+        tomcat_installations: []
+      when: tomcat_installations is not defined
+
+    - name: Collect all installation data
+      set_fact:
+        all_installations: "{{ all_installations | default([]) + hostvars[item]['tomcat_installations'] | default([]) }}"
+      loop: "{{ groups['all'] }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Debug aggregated installation data
+      debug:
+        msg: |
+          Total installations collected: {{ all_installations | length }}
+          Servers with installations: {{ all_installations | map(attribute='hostname') | list | unique | length }}
+          All hostnames: {{ all_installations | map(attribute='hostname') | list | unique }}
+      delegate_to: localhost
+      run_once: true
+
+    - name: Debug installation data per host
+      debug:
+        msg: |
+          Host: {{ ansible_hostname }}
+          IP: {{ ansible_default_ipv4.address }}
+          FQDN: {{ ansible_fqdn }}
+          Installations found: {{ tomcat_installations | default([]) | length }}
+          {% if tomcat_installations is defined and tomcat_installations | length > 0 %}
+          Installation details:
+          {% for installation in tomcat_installations %}
+          - Name: {{ installation.name }}
+          - Path: {{ installation.path }}
+          - Version: {{ installation.version }}
+          - Status: {{ installation.status }}
+          - Database Type: {{ installation.database_type | default('Unknown') }}
+          - Database Schema: {{ installation.database_schema | default('Unknown') }}
+          - Database Driver: {{ installation.database_driver | default('Unknown') }}
+          - Database Hostname: {{ installation.database_hostname | default('Unknown') }}
+          - Database User: {{ installation.database_user | default('Unknown') }}
+          {% endfor %}
+          {% endif %}
+
+    - name: Generate HTML report
+      copy:
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Tomcat Installation Report - {{ ansible_date_time.date }}</title>
+              <style>
+                  * {
+                      margin: 0;
+                      padding: 0;
+                      box-sizing: border-box;
+                  }
+                  
+                  body {
+                      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                      min-height: 100vh;
+                      padding: 20px;
+                  }
+                  
+                  .container {
+                      max-width: 1400px;
+                      margin: 0 auto;
+                      background: white;
+                      border-radius: 15px;
+                      box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                      overflow: hidden;
+                  }
+                  
+                  .header {
+                      background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+                      color: white;
+                      padding: 30px;
+                      text-align: center;
+                      position: relative;
+                  }
+                  
+                  .header::before {
+                      content: '';
+                      position: absolute;
+                      top: 0;
+                      left: 0;
+                      right: 0;
+                      bottom: 0;
+                      background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="2" fill="rgba(255,255,255,0.1)"/></svg>') repeat;
+                      opacity: 0.3;
+                  }
+                  
+                  .header h1 {
+                      font-size: 2.5rem;
+                      margin-bottom: 10px;
+                      position: relative;
+                      z-index: 1;
+                  }
+                  
+                  .header .subtitle {
+                      font-size: 1.2rem;
+                      opacity: 0.9;
+                      position: relative;
+                      z-index: 1;
+                  }
+                  
+                  .stats {
+                      display: grid;
+                      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                      gap: 20px;
+                      padding: 30px;
+                      background: #f8f9fa;
+                  }
+                  
+                  .stat-card {
+                      background: white;
+                      padding: 25px;
+                      border-radius: 10px;
+                      text-align: center;
+                      box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+                      transition: transform 0.3s ease;
+                  }
+                  
+                  .stat-card:hover {
+                      transform: translateY(-5px);
+                  }
+                  
+                  .stat-number {
+                      font-size: 3rem;
+                      font-weight: bold;
+                      color: #2c3e50;
+                      margin-bottom: 10px;
+                  }
+                  
+                  .stat-label {
+                      font-size: 1.1rem;
+                      color: #7f8c8d;
+                      text-transform: uppercase;
+                      letter-spacing: 1px;
+                  }
+                  
+                  .content {
+                      padding: 30px;
+                  }
+                  
+                  .server-section {
+                      margin-bottom: 50px;
+                      border: 3px solid #ecf0f1;
+                      border-radius: 15px;
+                      overflow: hidden;
+                      box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+                      transition: transform 0.3s ease, box-shadow 0.3s ease;
+                  }
+                  
+                  .server-section:hover {
+                      transform: translateY(-5px);
+                      box-shadow: 0 15px 40px rgba(0,0,0,0.15);
+                  }
+                  
+                  .server-hostname-banner {
+                      background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+                      color: white;
+                      padding: 20px;
+                      text-align: center;
+                      font-size: 1.8rem;
+                      font-weight: bold;
+                      text-transform: uppercase;
+                      letter-spacing: 2px;
+                      border-bottom: 3px solid #c0392b;
+                      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                  }
+                  
+                  .server-header {
+                      background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+                      color: #495057;
+                      padding: 15px 25px;
+                      display: flex;
+                      justify-content: space-between;
+                      align-items: center;
+                      border-bottom: 1px solid #dee2e6;
+                      font-size: 0.9rem;
+                  }
+                  
+                  .server-title {
+                      font-size: 1rem;
+                      font-weight: normal;
+                      display: flex;
+                      align-items: center;
+                      gap: 10px;
+                  }
+                  
+                  .server-info {
+                      font-size: 0.9rem;
+                      text-align: right;
+                      line-height: 1.4;
+                  }
+                  
+                  .installations-table {
+                      width: 100%;
+                      border-collapse: collapse;
+                      margin-top: 0;
+                  }
+                  
+                  .installations-table th {
+                      background: #34495e;
+                      color: white;
+                      padding: 15px;
+                      text-align: left;
+                      font-weight: 600;
+                      text-transform: uppercase;
+                      letter-spacing: 0.5px;
+                      font-size: 0.9rem;
+                  }
+                  
+                  .installations-table td {
+                      padding: 15px;
+                      border-bottom: 1px solid #ecf0f1;
+                      vertical-align: middle;
+                  }
+                  
+                  .installations-table tbody tr:hover {
+                      background: #f8f9fa;
+                  }
+                  
+                  .installations-table tbody tr:nth-child(even) {
+                      background: #fdfdfd;
+                  }
+                  
+                  .status-badge {
+                      padding: 6px 12px;
+                      border-radius: 20px;
+                      font-size: 0.8rem;
+                      font-weight: bold;
+                      text-transform: uppercase;
+                      letter-spacing: 0.5px;
+                  }
+                  
+                  .status-running {
+                      background: #d4edda;
+                      color: #155724;
+                      border: 1px solid #c3e6cb;
+                  }
+                  
+                  .status-stopped {
+                      background: #f8d7da;
+                      color: #721c24;
+                      border: 1px solid #f5c6cb;
+                  }
+                  
+                  .version-info {
+                      font-family: 'Courier New', monospace;
+                      font-size: 0.9rem;
+                      background: #f8f9fa;
+                      padding: 5px 8px;
+                      border-radius: 4px;
+                      display: inline-block;
+                  }
+                  
+                  .path-info {
+                      font-family: 'Courier New', monospace;
+                      font-size: 0.85rem;
+                      color: #495057;
+                      word-break: break-all;
+                  }
+                  
+                  .ports-list {
+                      font-family: 'Courier New', monospace;
+                      font-size: 0.9rem;
+                      color: #6c757d;
+                  }
+                  
+                  .ports-running {
+                      color: #28a745;
+                      font-weight: bold;
+                  }
+                  
+                  .ports-stopped {
+                      color: #dc3545;
+                      font-style: italic;
+                  }
+                  
+                  .version-unknown {
+                      color: #e74c3c;
+                      font-style: italic;
+                  }
+                  
+                  .server-hostname-banner {
+                      background: linear-gradient(135deg, #e67e22 0%, #d35400 100%);
+                      color: white;
+                      padding: 15px 25px;
+                      margin: 0;
+                      font-size: 1.3rem;
+                      font-weight: bold;
+                      text-align: center;
+                      border-bottom: 3px solid #d35400;
+                      text-transform: uppercase;
+                      letter-spacing: 1px;
+                      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                  }
+                  
+                  .no-installations {
+                      text-align: center;
+                      padding: 50px;
+                      color: #6c757d;
+                      font-size: 1.2rem;
+                      background: #f8f9fa;
+                      border-radius: 10px;
+                      margin: 20px;
+                  }
+                  
+                  .footer {
+                      background: #2c3e50;
+                      color: white;
+                      text-align: center;
+                      padding: 20px;
+                      font-size: 0.9rem;
+                  }
+                  
+                  .footer a {
+                      color: #3498db;
+                      text-decoration: none;
+                  }
+                  
+                  .footer a:hover {
+                      text-decoration: underline;
+                  }
+                  
+                  @media (max-width: 768px) {
+                      .header h1 {
+                          font-size: 2rem;
+                      }
+                      
+                      .stats {
+                          grid-template-columns: 1fr;
+                      }
+                      
+                      .server-header {
+                          flex-direction: column;
+                          gap: 10px;
+                      }
+                      
+                      .installations-table {
+                          font-size: 0.8rem;
+                      }
+                      
+                      .installations-table th,
+                      .installations-table td {
+                          padding: 10px 8px;
+                      }
+                  }
+                  
+                  .database-info {
+                      font-size: 0.9rem;
+                      display: inline-block;
+                      padding: 4px 8px;
+                      border-radius: 4px;
+                      background: #f8f9fa;
+                      border: 1px solid #e9ecef;
+                  }
+                  
+                  .database-type {
+                      background: #d4edda;
+                      color: #155724;
+                      border-color: #c3e6cb;
+                  }
+                  
+                  .database-schema {
+                      background: #cce5ff;
+                      color: #004085;
+                      border-color: #b3d9ff;
+                      font-family: 'Courier New', monospace;
+                  }
+                  
+                  .database-driver {
+                      background: #fff3cd;
+                      color: #856404;
+                      border-color: #ffeaa7;
+                      font-family: 'Courier New', monospace;
+                      font-size: 0.8rem;
+                  }
+                  
+                  .database-unknown {
+                      background: #f8d7da;
+                      color: #721c24;
+                      border-color: #f5c6cb;
+                      font-style: italic;
+                  }
+                  
+                  .database-not-running {
+                      background: #e2e3e5;
+                      color: #6c757d;
+                      border-color: #d6d8db;
+                      font-style: italic;
+                  }
+                  
+                  .database-details {
+                      background: #f8f9fa;
+                      border: 1px solid #dee2e6;
+                      border-radius: 4px;
+                      padding: 8px;
+                      margin-top: 5px;
+                      font-size: 0.8rem;
+                  }
+                  
+                  .database-detail-item {
+                      margin: 3px 0;
+                      padding: 2px 4px;
+                      background: #fff;
+                      border: 1px solid #e9ecef;
+                      border-radius: 3px;
+                  }
+                  
+                  .database-detail-label {
+                      font-weight: bold;
+                      color: #495057;
+                      margin-right: 5px;
+                  }
+                  
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header">
+                      <h1>Tomcat Installation Report</h1>
+                      <div class="subtitle">Generated on {{ ansible_date_time.iso8601 }}</div>
+                  </div>
+                  
+                  <div class="stats">
+                      <div class="stat-card">
+                          <div class="stat-number">{{ groups['all'] | length }}</div>
+                          <div class="stat-label">Servers Scanned</div>
+                      </div>
+                      <div class="stat-card">
+                          <div class="stat-number">{{ all_installations | length }}</div>
+                          <div class="stat-label">Total Installations</div>
+                      </div>
+                      <div class="stat-card">
+                          <div class="stat-number">{{ all_installations | selectattr('status', 'equalto', 'Running') | list | length }}</div>
+                          <div class="stat-label">Running Instances</div>
+                      </div>
+                      <div class="stat-card">
+                          <div class="stat-number">{{ all_installations | selectattr('status', 'equalto', 'Stopped') | list | length }}</div>
+                          <div class="stat-label">Stopped Instances</div>
+                      </div>
+                      <div class="stat-card">
+                          <div class="stat-number">{{ all_installations | selectattr('database_type', 'defined') | rejectattr('database_type', 'in', ['Unknown', 'Not Running']) | list | length }}</div>
+                          <div class="stat-label">With Database</div>
+                      </div>
+                      <div class="stat-card">
+                          <div class="stat-number">{{ all_installations | selectattr('database_type', 'defined') | rejectattr('database_type', 'in', ['Unknown', 'Not Running']) | map(attribute='database_type') | list | unique | length }}</div>
+                          <div class="stat-label">Database Types</div>
+                      </div>
+                  </div>
+                  
+                  <div class="content">
+                      <!-- Show all servers, even those without Tomcat installations -->
+                      {% set all_servers = [] %}
+                      {% for host in groups['all'] %}
+                        {% set host_hostname = hostvars[host].get('ansible_hostname', host) %}
+                        {% set host_fqdn = hostvars[host].get('ansible_fqdn', host) %}
+                        {% set host_ip = hostvars[host].get('ansible_default_ipv4', {}).get('address', 'N/A') %}
+                        {% set host_installations = all_installations | selectattr('hostname', 'equalto', host_hostname) | list %}
+                        {% if host_installations | length > 0 %}
+                          {% set dummy = all_servers.append({'hostname': host_hostname, 'fqdn': host_fqdn, 'ip': host_ip, 'installations': host_installations}) %}
+                        {% else %}
+                          {% set dummy = all_servers.append({'hostname': host_hostname, 'fqdn': host_fqdn, 'ip': host_ip, 'installations': []}) %}
+                        {% endif %}
+                      {% endfor %}
+                      
+                      {% for server in all_servers %}
+                      <div style="border-top: 3px solid #34495e; margin: 40px 0; position: relative;">
+                          <div style="position: absolute; top: -15px; left: 50%; transform: translateX(-50%); background: #34495e; color: white; padding: 8px 20px; font-weight: 600; font-size: 1rem; text-transform: uppercase; letter-spacing: 0.5px; border-radius: 4px; text-align: center; min-width: 200px;">
+                              {{ server.hostname }}
+                              <div style="font-size: 0.8rem; font-weight: normal; margin-top: 2px; opacity: 0.9;">
+                                  IP: {{ server.ip }} | Installations: {{ server.installations | length }} | Running: {{ server.installations | selectattr('status', 'equalto', 'Running') | list | length }}
+                              </div>
+                          </div>
+                      </div>
+                      <div class="server-section">
+                          
+                          {% if server.installations | length > 0 %}
+                          <table class="installations-table">
+                              <thead>
+                                  <tr>
+                                      <th style="width: 7%;">Installation Name</th>
+                                      <th style="width: 11%;">Installation Path</th>
+                                      <th style="width: 9%;">Working Directory</th>
+                                      <th style="width: 7%;">Version</th>
+                                      <th style="width: 4%;">Status</th>
+                                      <th style="width: 6%;">Configured Ports</th>
+                                      <th style="width: 6%;">Running Ports</th>
+                                      <th style="width: 4%;">Size</th>
+                                      <th style="width: 7%;">Database Type</th>
+                                      <th style="width: 7%;">Database Schema</th>
+                                      <th style="width: 9%;">Database Server</th>
+                                      <th style="width: 7%;">Database User</th>
+                                      <th style="width: 8%;">Database Details</th>
+                                      <th style="width: 4%;">Services</th>
+                                  </tr>
+                              </thead>
+                              <tbody>
+                                  {% for installation in server.installations %}
+                                  <tr>
+                                      <td><strong>{{ installation.name }}</strong></td>
+                                      <td><span class="path-info">{{ installation.path }}</span></td>
+                                      <td><span class="path-info">{{ installation.working_directory }}</span></td>
+                                      <td>
+                                          <span class="version-info">
+                                              {% if installation.version == 'Unknown' or installation.version == '' or installation.version.startswith('Version: Unknown') %}
+                                              <span style="color: #e74c3c;">{{ installation.version }}</span>
+                                              {% else %}
+                                              {{ installation.version }}
+                                              {% endif %}
+                                          </span>
+                                      </td>
+                                      <td>
+                                          <span class="status-badge {{ 'status-running' if installation.status == 'Running' else 'status-stopped' }}">
+                                              {{ installation.status }}
+                                          </span>
+                                      </td>
+                                      <td><span class="ports-list">{{ installation.configured_ports }}</span></td>
+                                      <td>
+                                          <span class="ports-list {{ 'ports-running' if installation.actual_ports != 'Not Running' else 'ports-stopped' }}">
+                                              {{ installation.actual_ports }}
+                                          </span>
+                                      </td>
+                                      <td>{{ installation.size }}</td>
+                                      <td>
+                                          <span class="database-info">
+                                              {% if installation.database_type == 'Unknown' or installation.database_type == 'Not Running' %}
+                                              <span style="color: #6c757d; font-style: italic;">{{ installation.database_type }}</span>
+                                              {% else %}
+                                              <span style="color: #28a745; font-weight: bold;">{{ installation.database_type }}</span>
+                                              {% endif %}
+                                          </span>
+                                      </td>
+                                      <td>
+                                          <span class="database-info">
+                                              {% if installation.database_schema == 'Unknown' or installation.database_schema == 'Not Running' %}
+                                              <span style="color: #6c757d; font-style: italic;">{{ installation.database_schema }}</span>
+                                              {% else %}
+                                              <span style="color: #007bff; font-family: monospace;">{{ installation.database_schema }}</span>
+                                              {% endif %}
+                                          </span>
+                                      </td>
+                                      <td>
+                                          <span class="database-info">
+                                              {% if installation.database_hostname == 'Unknown' or installation.database_hostname == 'Not Running' %}
+                                              <span style="color: #6c757d; font-style: italic;">{{ installation.database_hostname }}</span>
+                                              {% else %}
+                                              <span style="color: #17a2b8; font-family: monospace;">{{ installation.database_hostname }}</span>
+                                              {% endif %}
+                                          </span>
+                                      </td>
+                                      <td>
+                                          <span class="database-info">
+                                              {% if installation.database_user == 'Unknown' or installation.database_user == 'Not Running' %}
+                                              <span style="color: #6c757d; font-style: italic;">{{ installation.database_user }}</span>
+                                              {% else %}
+                                              <span style="color: #28a745; font-family: monospace;">{{ installation.database_user }}</span>
+                                              {% endif %}
+                                          </span>
+                                      </td>
+                                      <td>
+                                          <div class="database-details">
+                                              {% if installation.database_driver != 'Unknown' and installation.database_driver != 'Not Running' %}
+                                              <div class="database-detail-item">
+                                                  <span class="database-detail-label">Driver:</span>
+                                                  <span style="font-family: monospace; font-size: 0.8rem;">{{ installation.database_driver }}</span>
+                                              </div>
+                                              {% endif %}
+                                              {% if installation.database_jars != 'None' and installation.database_jars != 'Unknown' %}
+                                              <div class="database-detail-item">
+                                                  <span class="database-detail-label">JAR Files:</span>
+                                                  <span style="font-family: monospace; font-size: 0.8rem;">{{ installation.database_jars }}</span>
+                                              </div>
+                                              {% endif %}
+                                              {% if installation.connection_pools != '0' %}
+                                              <div class="database-detail-item">
+                                                  <span class="database-detail-label">Connection Pools:</span>
+                                                  <span style="color: #007bff;">{{ installation.connection_pools }}</span>
+                                              </div>
+                                              {% endif %}
+                                              {% if installation.jndi_datasources != '0' %}
+                                              <div class="database-detail-item">
+                                                  <span class="database-detail-label">JNDI DataSources:</span>
+                                                  <span style="color: #007bff;">{{ installation.jndi_datasources }}</span>
+                                              </div>
+                                              {% endif %}
+                                          </div>
+                                      </td>
+                                      <td>{{ installation.services }}</td>
+                                  </tr>
+                                  {% endfor %}
+                              </tbody>
+                          </table>
+                          {% else %}
+                          <div class="no-installations">
+                              <i class="fas fa-exclamation-triangle"></i>
+                              No Tomcat installations found on this server
+                          </div>
+                          {% endif %}
+                      </div>
+                      {% endfor %}
+                  </div>
+                  
+                  <div class="footer">
+                      Report generated by Tomcat Management Suite<br>
+                      <small>Last updated: {{ ansible_date_time.iso8601 }}</small>
+                  </div>
+              </div>
+          </body>
+          </html>
+        dest: "{{ report_dir }}/{{ report_filename }}"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Display report location
+      debug:
+        msg: |
+          Tomcat Installation Report Generated Successfully!
+          ====================================================
+          
+          Report Location: {{ report_dir }}/{{ report_filename }}
+          Total Servers Scanned: {{ groups['all'] | length }}
+          Total Installations Found: {{ all_installations | length }}
+          Running Instances: {{ all_installations | selectattr('status', 'equalto', 'Running') | list | length }}
+          Stopped Instances: {{ all_installations | selectattr('status', 'equalto', 'Stopped') | list | length }}
+          
+          To email this report, run:
+          ansible-playbook tomcat_report.yml -e email_to=admin@example.com
+          
+          To view the report, open: {{ report_dir }}/{{ report_filename }} in your browser
+      delegate_to: localhost
+      run_once: true
+
+    - name: Read HTML report content for email
+      slurp:
+        src: "{{ report_dir }}/{{ report_filename }}"
+      register: html_report_content
+      delegate_to: localhost
+      run_once: true
+      when: 
+        - email_to is defined
+        - email_to != ""
+
+    - name: Send email report with embedded HTML
+      mail:
+        to: "{{ email_to }}"
+        from: "{{ email_from }}"
+        subject: "{{ email_subject }}"
+        body: "{{ html_report_content.content | b64decode }}"
+        charset: utf8
+        subtype: html
+      delegate_to: localhost
+      run_once: true
+      when: 
+        - email_to is defined
+        - email_to != ""
+        - html_report_content is defined
+      ignore_errors: yes
+
+    - name: Email send status
+      debug:
+        msg: |
+          Email Status: {{ 'SUCCESS - HTML report sent embedded in email to ' + email_to if email_to is defined and email_to != '' else 'SKIPPED - No email address provided' }}
+          
+          To send embedded HTML report via email, use:
+          ansible-playbook tomcat_report.yml -e email_to=admin@example.com
+          
+          Local report file: {{ report_dir }}/{{ report_filename }}
+      delegate_to: localhost
+      run_once: true
+
+    - name: Cleanup temporarily installed Java
+      block:
+        - name: Remove temporarily installed Java
+          shell: |
+            if [ -f /etc/redhat-release ] || [ -f /etc/centos-release ]; then
+              # RHEL/CentOS
+              echo "Removing Java from RHEL/CentOS..."
+              yum remove -y java-1.8.0-openjdk java-11-openjdk 2>/dev/null || echo "Java removal completed"
+            elif [ -f /etc/debian_version ]; then
+              # Debian/Ubuntu
+              echo "Removing Java from Debian/Ubuntu..."
+              apt-get remove -y openjdk-8-jdk openjdk-11-jdk 2>/dev/null || echo "Java removal completed"
+              apt-get autoremove -y 2>/dev/null || true
+            elif [ -f /etc/arch-release ]; then
+              # Arch Linux
+              echo "Removing Java from Arch Linux..."
+              pacman -R --noconfirm jdk8-openjdk jdk11-openjdk 2>/dev/null || echo "Java removal completed"
+            elif [ -f /etc/alpine-release ]; then
+              # Alpine Linux
+              echo "Removing Java from Alpine Linux..."
+              apk del openjdk8 openjdk11 2>/dev/null || echo "Java removal completed"
+            elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
+              # SUSE
+              echo "Removing Java from SUSE..."
+              zypper remove -y java-1_8_0-openjdk java-11-openjdk 2>/dev/null || echo "Java removal completed"
+            else
+              echo "Unknown OS, cannot remove Java automatically"
+            fi
+          ignore_errors: yes
+          when: java_was_installed is defined and java_was_installed == true
+
+        - name: Clean up package cache
+          shell: |
+            if [ -f /etc/redhat-release ] || [ -f /etc/centos-release ]; then
+              yum clean all 2>/dev/null || true
+            elif [ -f /etc/debian_version ]; then
+              apt-get clean 2>/dev/null || true
+            elif [ -f /etc/arch-release ]; then
+              pacman -Sc --noconfirm 2>/dev/null || true
+            elif [ -f /etc/alpine-release ]; then
+              apk cache clean 2>/dev/null || true
+            elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
+              zypper clean 2>/dev/null || true
+            fi
+          ignore_errors: yes
+          when: java_was_installed is defined and java_was_installed == true
+
+      when: java_was_installed is defined and java_was_installed == true
+

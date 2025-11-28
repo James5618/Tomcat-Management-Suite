@@ -1,0 +1,552 @@
+---
+- name: Find and upgrade Apache Tomcat 7 to latest version
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    tomcat_latest_version: "7.0.109"  # Update this to the latest Tomcat 7 version
+    tomcat_download_url: "https://archive.apache.org/dist/tomcat/tomcat-7/v{{ tomcat_latest_version }}/bin/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+    tomcat_backup_dir: "/tmp/tomcat7_backup_{{ ansible_date_time.epoch }}"
+    tomcat_user: "tomcat"
+    tomcat_group: "tomcat"
+    
+  tasks:
+    - name: Check if system is supported
+      assert:
+        that:
+          - ansible_os_family in ['RedHat', 'Debian', 'Ubuntu']
+        fail_msg: "This playbook only supports RedHat/CentOS/RHEL and Debian/Ubuntu systems"
+
+    - name: Create backup directory
+      file:
+        path: "{{ tomcat_backup_dir }}"
+        state: directory
+        mode: '0755'
+
+    # Find Tomcat installations
+    - name: Find Tomcat installations by process
+      shell: |
+        ps aux | grep -i tomcat | grep -v grep | awk '{print $2}' | xargs -I {} ls -l /proc/{}/exe 2>/dev/null | grep -E "(tomcat|catalina)" | head -10
+      register: tomcat_processes
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Find Tomcat installations by common directories
+      find:
+        paths:
+          - /opt
+          - /usr/local
+          - /home
+          - /var/lib
+          - /usr/share
+        patterns: 
+          - "tomcat*"
+          - "apache-tomcat*"
+          - "tomcat7*"
+        file_type: directory
+        recurse: no
+      register: tomcat_directories
+
+    - name: Find Tomcat installations by binary locations
+      find:
+        paths:
+          - /usr/bin
+          - /usr/local/bin
+          - /opt/tomcat/bin
+          - /opt/tomcat7/bin
+          - /usr/share/tomcat7/bin
+          - /opt/
+        patterns: 
+          - "catalina.sh"
+          - "startup.sh"
+          - "tomcat*"
+        file_type: file
+      register: tomcat_binaries
+
+    - name: Check systemd services for Tomcat
+      shell: systemctl list-units --type=service | grep -i tomcat | awk '{print $1}'
+      register: tomcat_services
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Check for package-managed Tomcat 7 installations
+      shell: |
+        if command -v dpkg >/dev/null 2>&1; then
+          dpkg -l | grep -i tomcat7 | awk '{print $2}'
+        elif command -v rpm >/dev/null 2>&1; then
+          rpm -qa | grep -i tomcat7
+        fi
+      register: tomcat_packages
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Verify Tomcat installations and get versions
+      shell: |
+        if [ -f "{{ item.path }}/bin/version.sh" ]; then
+          cd "{{ item.path }}"
+          ./bin/version.sh 2>/dev/null | grep "Server version" | head -1
+        elif [ -f "{{ item.path }}/bin/catalina.sh" ]; then
+          cd "{{ item.path }}"
+          ./bin/catalina.sh version 2>/dev/null | grep "Server version" | head -1
+        fi
+      register: tomcat_versions
+      loop: "{{ tomcat_directories.files }}"
+      when: tomcat_directories.files is defined
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display found Tomcat installations
+      debug:
+        msg: |
+          Found Tomcat installation at: {{ item.item.path }}
+          Version: {{ item.stdout | default('Unknown') }}
+      loop: "{{ tomcat_versions.results }}"
+      when: 
+        - item.stdout is defined
+        - item.stdout != ""
+        - "'Apache Tomcat/7' in item.stdout"
+
+    - name: Filter Tomcat 7 installations that need upgrade
+      set_fact:
+        tomcat7_installations: "{{ tomcat7_installations | default([]) + [item.item.path] }}"
+      loop: "{{ tomcat_versions.results }}"
+      when: 
+        - item.stdout is defined
+        - item.stdout != ""
+        - "'Apache Tomcat/7' in item.stdout"
+        - "tomcat_latest_version not in item.stdout"
+
+    - name: Display Tomcat 7 installations that will be upgraded
+      debug:
+        msg: "Will upgrade Tomcat 7 installation at: {{ item }}"
+      loop: "{{ tomcat7_installations | default([]) }}"
+
+    - name: Warning about Tomcat 7 End of Life
+      debug:
+        msg: |
+          WARNING: Apache Tomcat 7 reached End of Life on March 31, 2021
+          This version is no longer supported and may have security vulnerabilities.
+          Consider upgrading to Tomcat 9 or 10 for continued security support.
+          This playbook will upgrade to the latest available Tomcat 7 version ({{ tomcat_latest_version }}).
+      when: tomcat7_installations is defined and tomcat7_installations | length > 0
+
+    - name: Stop Tomcat services before upgrade
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop: "{{ tomcat_services.stdout_lines | default([]) }}"
+      when: tomcat_services.stdout_lines is defined
+      ignore_errors: yes
+
+    - name: Stop Tomcat processes manually
+      shell: |
+        CATALINA_HOME="{{ item }}"
+        if [ -f "$CATALINA_HOME/bin/shutdown.sh" ]; then
+          cd "$CATALINA_HOME"
+          ./bin/shutdown.sh
+          sleep 5
+        fi
+        # Force kill if still running
+        pkill -f "{{ item }}" || true
+      loop: "{{ tomcat7_installations | default([]) }}"
+      ignore_errors: yes
+
+    - name: Create comprehensive backup with metadata
+      block:
+        - name: Create individual backup directories
+          file:
+            path: "{{ tomcat_backup_dir }}/{{ item | basename }}"
+            state: directory
+            mode: '0755'
+          loop: "{{ tomcat7_installations | default([]) }}"
+
+        - name: Create tar backup of each Tomcat installation
+          archive:
+            path: "{{ item }}"
+            dest: "{{ tomcat_backup_dir }}/{{ item | basename }}/tomcat7_backup_{{ item | basename }}_{{ ansible_date_time.epoch }}.tar"
+            format: tar
+            owner: root
+            group: root
+            mode: '0644'
+          loop: "{{ tomcat7_installations | default([]) }}"
+          register: backup_results
+
+        - name: Get current Tomcat version for backup metadata
+          shell: |
+            cd "{{ item }}"
+            if [ -f "bin/version.sh" ]; then
+              ./bin/version.sh 2>/dev/null | grep "Server version" | head -1
+            elif [ -f "bin/catalina.sh" ]; then
+              ./bin/catalina.sh version 2>/dev/null | grep "Server version" | head -1
+            else
+              echo "Version unknown"
+            fi
+          register: backup_version_info
+          loop: "{{ tomcat7_installations | default([]) }}"
+          ignore_errors: yes
+
+        - name: Create backup metadata file
+          copy:
+            content: |
+              # Tomcat 7 Backup Metadata
+              # Created: {{ ansible_date_time.iso8601 }}
+              # Hostname: {{ ansible_hostname }}
+              # Playbook executed by: {{ ansible_user_id }}
+              
+              {% for item in tomcat7_installations | default([]) %}
+              [{{ item | basename }}]
+              original_path={{ item }}
+              backup_file={{ tomcat_backup_dir }}/{{ item | basename }}/tomcat7_backup_{{ item | basename }}_{{ ansible_date_time.epoch }}.tar
+              hostname={{ ansible_hostname }}
+              backup_date={{ ansible_date_time.iso8601 }}
+              original_version={{ backup_version_info.results[loop.index0].stdout | default('unknown') }}
+              upgraded_to={{ tomcat_latest_version }}
+              user={{ tomcat_user }}
+              group={{ tomcat_group }}
+              
+              {% endfor %}
+            dest: "{{ tomcat_backup_dir }}/backup_metadata.txt"
+            mode: '0644'
+
+        - name: Create JSON backup metadata for automation
+          copy:
+            content: |
+              {
+                "backup_info": {
+                  "created": "{{ ansible_date_time.iso8601 }}",
+                  "hostname": "{{ ansible_hostname }}",
+                  "executor": "{{ ansible_user_id }}",
+                  "latest_version": "{{ tomcat_latest_version }}",
+                  "backup_type": "tomcat7_upgrade",
+                  "playbook_version": "1.0"
+                },
+                "installations": [
+              {% for item in tomcat7_installations | default([]) %}
+                  {
+                    "name": "{{ item | basename }}",
+                    "original_path": "{{ item }}",
+                    "backup_file": "{{ tomcat_backup_dir }}/{{ item | basename }}/tomcat7_backup_{{ item | basename }}_{{ ansible_date_time.epoch }}.tar",
+                    "hostname": "{{ ansible_hostname }}",
+                    "backup_date": "{{ ansible_date_time.iso8601 }}",
+                    "original_version": "{{ backup_version_info.results[loop.index0].stdout | default('unknown') }}",
+                    "upgraded_to": "{{ tomcat_latest_version }}",
+                    "user": "{{ tomcat_user }}",
+                    "group": "{{ tomcat_group }}"
+                  }{% if not loop.last %},{% endif %}
+              {% endfor %}
+                ]
+              }
+            dest: "{{ tomcat_backup_dir }}/backup_metadata.json"
+            mode: '0644'
+
+        - name: Display backup information
+          debug:
+            msg: |
+              Created backup for {{ item.item }}:
+              - Original path: {{ item.item }}
+              - Backup file: {{ tomcat_backup_dir }}/{{ item.item | basename }}/tomcat7_backup_{{ item.item | basename }}_{{ ansible_date_time.epoch }}.tar
+              - Original version: {{ backup_version_info.results[loop.index0].stdout | default('unknown') }}
+          loop: "{{ backup_results.results | default([]) }}"
+          when: backup_results.results is defined
+
+      when: tomcat7_installations is defined and tomcat7_installations | length > 0
+
+    - name: Download latest Tomcat 7
+      get_url:
+        url: "{{ tomcat_download_url }}"
+        dest: "/tmp/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+        mode: '0644'
+        timeout: 300
+      when: tomcat7_installations is defined and tomcat7_installations | length > 0
+
+    - name: Extract new Tomcat version to temporary location
+      unarchive:
+        src: "/tmp/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+        dest: "/tmp"
+        remote_src: yes
+      when: tomcat7_installations is defined and tomcat7_installations | length > 0
+
+    - name: Upgrade each Tomcat installation
+      block:
+        - name: Backup configuration files
+          copy:
+            src: "{{ item }}/conf/"
+            dest: "{{ tomcat_backup_dir }}/{{ item | basename }}/conf/"
+            remote_src: yes
+          loop: "{{ tomcat7_installations | default([]) }}"
+
+        - name: Backup webapps directory
+          copy:
+            src: "{{ item }}/webapps/"
+            dest: "{{ tomcat_backup_dir }}/{{ item | basename }}/webapps/"
+            remote_src: yes
+          loop: "{{ tomcat7_installations | default([]) }}"
+
+        - name: Backup work directory (Tomcat 7 specific)
+          copy:
+            src: "{{ item }}/work/"
+            dest: "{{ tomcat_backup_dir }}/{{ item | basename }}/work/"
+            remote_src: yes
+          loop: "{{ tomcat7_installations | default([]) }}"
+          ignore_errors: yes
+
+        - name: Remove old Tomcat files (keep conf, webapps, work, and logs)
+          shell: |
+            cd "{{ item }}"
+            find . -mindepth 1 -maxdepth 1 -not -name 'conf' -not -name 'webapps' -not -name 'logs' -not -name 'work' -exec rm -rf {} +
+          loop: "{{ tomcat7_installations | default([]) }}"
+
+        - name: Copy new Tomcat files
+          shell: |
+            cd "/tmp/apache-tomcat-{{ tomcat_latest_version }}"
+            find . -mindepth 1 -maxdepth 1 -not -name 'conf' -not -name 'webapps' -not -name 'work' -exec cp -r {} "{{ item }}/" \;
+          loop: "{{ tomcat7_installations | default([]) }}"
+
+        - name: Update file permissions
+          file:
+            path: "{{ item }}"
+            owner: "{{ tomcat_user }}"
+            group: "{{ tomcat_group }}"
+            recurse: yes
+          loop: "{{ tomcat7_installations | default([]) }}"
+          ignore_errors: yes
+
+        - name: Make shell scripts executable
+          file:
+            path: "{{ tomcat_path }}/bin/{{ shell_script }}"
+            mode: '0755'
+          loop: "{{ tomcat7_installations | default([]) }}"
+          loop_control:
+            loop_var: tomcat_path
+          with_nested:
+            - "{{ tomcat7_installations | default([]) }}"
+            - ["catalina.sh", "startup.sh", "shutdown.sh", "version.sh", "digest.sh", "tool-wrapper.sh"]
+          vars:
+            shell_script: "{{ item[1] }}"
+          ignore_errors: yes
+
+        - name: Check Java compatibility for Tomcat 7
+          shell: |
+            if command -v java >/dev/null 2>&1; then
+              java -version 2>&1 | head -1
+            else
+              echo "Java not found"
+            fi
+          register: java_version_check
+          ignore_errors: yes
+          changed_when: false
+
+        - name: Display Java version compatibility warning
+          debug:
+            msg: |
+              Java version detected: {{ java_version_check.stdout | default('Unknown') }}
+              Note: Tomcat 7 requires Java 6 or later (Java 7+ recommended)
+              Ensure your Java version is compatible with Tomcat 7.
+          when: java_version_check.stdout is defined
+
+      when: tomcat7_installations is defined and tomcat7_installations | length > 0
+
+    - name: Start Tomcat services
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop: "{{ tomcat_services.stdout_lines | default([]) }}"
+      when: tomcat_services.stdout_lines is defined
+      ignore_errors: yes
+
+    - name: Start Tomcat manually if no systemd service
+      shell: |
+        cd "{{ item }}"
+        ./bin/startup.sh
+      loop: "{{ tomcat7_installations | default([]) }}"
+      when: 
+        - tomcat7_installations is defined
+        - (tomcat_services.stdout_lines is not defined or tomcat_services.stdout_lines | length == 0)
+
+    - name: Wait for Tomcat to start
+      wait_for:
+        port: 8080
+        host: "{{ ansible_default_ipv4.address }}"
+        timeout: 60
+      register: tomcat_startup_check
+      ignore_errors: yes
+
+    - name: Check if Tomcat is responding
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}:8080"
+        method: GET
+        status_code: [200, 404]  # 404 is OK for default Tomcat page
+        timeout: 10
+      register: tomcat_http_check
+      ignore_errors: yes
+
+    - name: Verify upgrade success
+      shell: |
+        cd "{{ item }}"
+        ./bin/version.sh | grep "Server version"
+      register: upgrade_verification
+      loop: "{{ tomcat7_installations | default([]) }}"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Check if rollback is needed
+      set_fact:
+        rollback_needed: true
+      when: 
+        - tomcat_startup_check.failed is defined and tomcat_startup_check.failed
+        - tomcat_http_check.failed is defined and tomcat_http_check.failed
+
+    - name: Rollback if startup failed
+      block:
+        - name: Display rollback warning
+          debug:
+            msg: |
+              ⚠️  ROLLBACK INITIATED: Tomcat failed to start after upgrade
+              Rolling back to previous version...
+
+        - name: Stop failed Tomcat installation
+          shell: |
+            cd "{{ item }}"
+            ./bin/shutdown.sh || true
+            sleep 5
+            pkill -f "{{ item }}" || true
+          loop: "{{ tomcat7_installations | default([]) }}"
+          ignore_errors: yes
+
+        - name: Remove failed upgrade files
+          shell: |
+            cd "{{ item }}"
+            find . -mindepth 1 -maxdepth 1 -not -name 'conf' -not -name 'webapps' -not -name 'logs' -not -name 'work' -exec rm -rf {} +
+          loop: "{{ tomcat7_installations | default([]) }}"
+
+        - name: Restore from backup
+          unarchive:
+            src: "{{ tomcat_backup_dir }}/{{ item | basename }}/tomcat7_backup_{{ item | basename }}_{{ ansible_date_time.epoch }}.tar"
+            dest: "{{ item | dirname }}"
+            remote_src: yes
+          loop: "{{ tomcat7_installations | default([]) }}"
+
+        - name: Update file permissions after rollback
+          file:
+            path: "{{ item }}"
+            owner: "{{ tomcat_user }}"
+            group: "{{ tomcat_group }}"
+            recurse: yes
+          loop: "{{ tomcat7_installations | default([]) }}"
+          ignore_errors: yes
+
+        - name: Start restored Tomcat services
+          systemd:
+            name: "{{ item }}"
+            state: started
+            enabled: yes
+          loop: "{{ tomcat_services.stdout_lines | default([]) }}"
+          when: tomcat_services.stdout_lines is defined
+          ignore_errors: yes
+
+        - name: Start restored Tomcat manually if no systemd service
+          shell: |
+            cd "{{ item }}"
+            ./bin/startup.sh
+          loop: "{{ tomcat7_installations | default([]) }}"
+          when: 
+            - tomcat7_installations is defined
+            - (tomcat_services.stdout_lines is not defined or tomcat_services.stdout_lines | length == 0)
+
+        - name: Wait for restored Tomcat to start
+          wait_for:
+            port: 8080
+            host: "{{ ansible_default_ipv4.address }}"
+            timeout: 60
+          ignore_errors: yes
+
+        - name: Verify rollback success
+          shell: |
+            cd "{{ item }}"
+            ./bin/version.sh | grep "Server version"
+          register: rollback_verification
+          loop: "{{ tomcat7_installations | default([]) }}"
+          ignore_errors: yes
+          changed_when: false
+
+        - name: Display rollback results
+          debug:
+            msg: |
+              Rollback completed for {{ item.item }}:
+              {{ item.stdout | default('Rollback verification failed') }}
+          loop: "{{ rollback_verification.results | default([]) }}"
+          when: rollback_verification.results is defined
+
+        - name: Fail playbook after rollback
+          fail:
+            msg: |
+              Tomcat upgrade failed and has been rolled back to previous version.
+              Please check the logs and resolve any issues before retrying the upgrade.
+              Original backups are still available in {{ tomcat_backup_dir }}
+
+      when: rollback_needed is defined and rollback_needed
+
+    - name: Display upgrade results
+      debug:
+        msg: |
+          Tomcat installation at {{ item.item }}: 
+          {{ item.stdout | default('Verification failed') }}
+      loop: "{{ upgrade_verification.results | default([]) }}"
+      when: 
+        - upgrade_verification.results is defined
+        - rollback_needed is not defined or not rollback_needed
+
+    - name: Clean up downloaded files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/apache-tomcat-{{ tomcat_latest_version }}.tar.gz"
+        - "/tmp/apache-tomcat-{{ tomcat_latest_version }}"
+      when: tomcat7_installations is defined and tomcat7_installations | length > 0
+
+    - name: Display backup information
+      debug:
+        msg: |
+          Backup created at: {{ tomcat_backup_dir }}
+          This backup contains:
+          - Full backup of original Tomcat installations
+          - Configuration files
+          - Web applications
+          - Work directories
+          - JSON metadata for automated restore
+          Please keep this backup until you verify the upgrade is successful.
+      when: tomcat7_installations is defined and tomcat7_installations | length > 0
+
+    - name: Final summary with security warning
+      debug:
+        msg: |
+          Tomcat 7 upgrade completed successfully!
+          - Found {{ tomcat7_installations | default([]) | length }} Tomcat 7 installations
+          - All installations upgraded to version {{ tomcat_latest_version }}
+          - Backups stored in {{ tomcat_backup_dir }}
+          - Please verify your applications are working correctly
+          
+            IMPORTANT SECURITY NOTICE:
+          Tomcat 7 reached End of Life on March 31, 2021 and is no longer supported.
+          This version may contain unpatched security vulnerabilities.
+          Consider migrating to Tomcat 9 or 10 for continued security support.
+      when: 
+        - tomcat7_installations is defined and tomcat7_installations | length > 0
+        - rollback_needed is not defined or not rollback_needed
+
+    - name: Display package-managed Tomcat 7 installations
+      debug:
+        msg: |
+          Found package-managed Tomcat 7 installations:
+          {{ tomcat_packages.stdout_lines | default([]) | join(', ') }}
+          
+          Note: Package-managed installations should be upgraded using your system's package manager:
+          - Ubuntu/Debian: sudo apt update && sudo apt upgrade tomcat7
+          - CentOS/RHEL: sudo yum update tomcat7 (or sudo dnf update tomcat7)
+          
+          This playbook handles manual/tarball installations only.
+      when: 
+        - tomcat_packages.stdout_lines is defined 
+        - tomcat_packages.stdout_lines | length > 0
