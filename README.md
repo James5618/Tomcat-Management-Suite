@@ -549,9 +549,6 @@ tomcatsuite/
 ├── playbook-tomcat7.yml                    # Tomcat 7 minor upgrade
 ├── playbook-tomcat7-to-9-upgrade.yml       # Tomcat 7 to 9 major upgrade
 ├── tomcat_report.yml                       # Report generator
-├── retry_version_detection.sh              # Helper script
-├── test_external_retry_script.sh           # Test script
-├── README.txt                              # Text documentation
 └── README.md                               # This file
 ```
 
@@ -568,4 +565,5 @@ tomcatsuite/
 ```
 
 ---
+
 
